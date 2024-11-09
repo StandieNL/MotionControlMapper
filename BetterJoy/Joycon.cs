@@ -1,10 +1,12 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.Net.NetworkInformation;
 using System.Numerics;
 using System.Threading;
+using System.Threading.Tasks;
+using System.Windows.Documents;
 using System.Windows.Forms;
 using BetterJoy.Collections;
 using BetterJoy.Config;
@@ -30,27 +32,28 @@ public class Joycon
         Home = 7,
         Plus = 8,
         Capture = 9,
-        Stick = 10,
-        Shoulder1 = 11,
-        Shoulder2 = 12,
+        LS = 10,
+        LB = 11,
+        LT = 12,
 
         // For pro controller
         B = 13,
         A = 14,
         Y = 15,
         X = 16,
-        Stick2 = 17,
-        Shoulder21 = 18,
-        Shoulder22 = 19
+        RS = 17,
+        RB = 18,
+        RT = 19,
+
+        None = 256,
     }
 
     public enum ControllerType
     {
-        Pro,
         JoyconLeft,
         JoyconRight,
-        SNES,
-        N64
+        Pro,
+        SNES
     }
 
     public enum DebugType
@@ -91,6 +94,21 @@ public class Joycon
         Vertical
     }
 
+    public enum Axis
+    {
+        X,
+        Y,
+        Z,
+        All
+    }
+
+    public enum Direction
+    {
+        Positive,
+        Negative,
+        Both
+    }
+
     private enum ReceiveError
     {
         None,
@@ -128,6 +146,8 @@ public class Joycon
     private readonly bool[] _buttonsUp = new bool[20];
     private readonly bool[] _buttonsPrev = new bool[20];
     private readonly bool[] _buttonsRemapped = new bool[20];
+    private readonly bool[] _buttonsMotion = new bool[20];
+
 
     private readonly float[] _curRotation = { 0, 0, 0, 0, 0, 0 }; // Filtered IMU data
 
@@ -180,7 +200,7 @@ public class Joycon
     private float _deadzone2;
     private float _range;
     private float _range2;
-    
+
     private bool _doLocalize;
 
     private MainForm _form;
@@ -198,7 +218,6 @@ public class Joycon
     public OutputControllerDualShock4 OutDs4;
     public OutputControllerXbox360 OutXbox;
     private readonly object _updateInputLock = new object();
-    private readonly object _ctsCommunicationsLock = new object();
 
     public int PacketCounter;
 
@@ -254,13 +273,13 @@ public class Joycon
     private bool _calibrateSticks = false;
     private bool _calibrateIMU = false;
 
+    public readonly ReaderWriterLockSlim HidapiLock = new ReaderWriterLockSlim();
+
     private Stopwatch _timeSinceReceive = new();
     private RollingAverage _avgReceiveDeltaMs = new(100); // delta is around 10-16ms, so rolling average over 1000-1600ms
 
     private volatile bool _pauseSendCommands;
     private volatile bool _sendCommandsPaused;
-    private volatile bool _requestPowerOff;
-    private volatile bool _requestSetLEDByPadID;
 
     public Joycon(
         MainForm form,
@@ -311,9 +330,8 @@ public class Joycon
         TimestampCreation = new DateTimeOffset(DateTime.UtcNow).ToUnixTimeMilliseconds();
     }
 
-    public bool IsPro => Type is ControllerType.Pro;
+    public bool IsPro => Type is ControllerType.Pro or ControllerType.SNES;
     public bool IsSNES => Type == ControllerType.SNES;
-    public bool IsN64 => Type == ControllerType.N64;
     public bool IsJoycon => Type is ControllerType.JoyconRight or ControllerType.JoyconLeft;
     public bool IsLeft => Type != ControllerType.JoyconRight;
     public bool IsJoined => Other != null && Other != this;
@@ -325,7 +343,7 @@ public class Joycon
 
     public Joycon Other;
 
-    public bool SetLEDByPlayerNum(int id)
+    public void SetLEDByPlayerNum(int id)
     {
         if (id >= LedById.Length)
         {
@@ -335,29 +353,22 @@ public class Joycon
 
         byte led = LedById[id];
 
-        return SetPlayerLED(led);
+        SetPlayerLED(led);
     }
 
-    public bool SetLEDByPadID()
+    public void SetLEDByPadID()
     {
-        int id;
         if (!IsJoined)
         {
             // Set LED to current Pad ID
-            id = PadId;
+            SetLEDByPlayerNum(PadId);
         }
         else
         {
             // Set LED to current Joycon Pair
-            id = Math.Min(Other.PadId, PadId);
+            var lowestPadId = Math.Min(Other.PadId, PadId);
+            SetLEDByPlayerNum(lowestPadId);
         }
-
-        return SetLEDByPlayerNum(id);
-    }
-
-    public void RequestSetLEDByPadID()
-    {
-        _requestSetLEDByPadID = true;
     }
 
     public void GetActiveIMUData()
@@ -544,7 +555,7 @@ public class Joycon
             SerialOrMac = PadMacAddress.ToString().ToLower();
             return;
         }
-        
+
         // Serial = MAC address of the controller in bluetooth
         var mac = new byte[6];
         try
@@ -603,9 +614,9 @@ public class Joycon
         SubcommandCheck(0x01, [0x03], buf); // save pairing info
     }
 
-    public bool SetPlayerLED(byte leds = 0x00)
+    public void SetPlayerLED(byte leds = 0x00)
     {
-        return SubcommandCheck(0x30, [leds]) > 0;
+        SubcommandCheck(0x30, [leds]);
     }
 
     public void BlinkHomeLight()
@@ -665,11 +676,6 @@ public class Joycon
 
     private void SetIMU(bool enable)
     {
-        if (!IMUSupported())
-        {
-            return;
-        }
-
         SubcommandCheck(0x40, [enable ? (byte)0x01 : (byte)0x00]);
     }
 
@@ -678,14 +684,14 @@ public class Joycon
         SubcommandCheck(0x48, [enable ? (byte)0x01 : (byte)0x00]);
     }
 
-    private bool SetReportMode(ReportMode reportMode, bool checkResponse = true)
+    private void SetReportMode(ReportMode reportMode, bool checkResponse = true)
     {
         if (checkResponse)
         {
-            return SubcommandCheck(0x03, [(byte)reportMode]) > 0;
+            SubcommandCheck(0x03, [(byte)reportMode]);
+            return;
         }
         Subcommand(0x03, [(byte)reportMode]);
-        return true;
     }
 
     private void BTActivate()
@@ -705,27 +711,14 @@ public class Joycon
         if (IsDeviceReady)
         {
             Log("Powering off.");
-
-            // < 0 = error = we assume it's powered off, ideally should check for 0x0000048F (device not connected) error in hidapi
-            var length = SetHCIState(0x00);
-            if (length != 0)
+            if (SetHCIState(0x00) > 0)
             {
-                Drop(false, false);
+                State = Status.Dropped;
                 return true;
             }
         }
 
         return false;
-    }
-
-    public void RequestPowerOff()
-    {
-        _requestPowerOff = true;
-    }
-
-    public void WaitPowerOff(int timeoutMs)
-    {
-        _receiveReportsThread?.Join(timeoutMs);
     }
 
     private void BatteryChanged()
@@ -745,23 +738,6 @@ public class Joycon
         _form.SetCharging(this, Charging);
     }
 
-    private static bool Retry(Func<bool> func, int waitMs = 500, int nbAttempt = 3)
-    {
-        bool success = false;
-
-        for (int attempt = 0; attempt < nbAttempt && !success; ++attempt)
-        {
-            if (attempt > 0)
-            {
-                Thread.Sleep(waitMs);
-            }
-
-            success = func();
-        }
-
-        return success;
-    }
-
     public void Detach(bool close = true)
     {
         if (State == Status.NotAttached)
@@ -769,7 +745,7 @@ public class Joycon
             return;
         }
 
-        AbortCommunicationThreads();
+        WaitCommunicationThreads();
         DisconnectViGEm();
         _rumbles.Clear();
 
@@ -779,59 +755,45 @@ public class Joycon
             {
                 //SetIMU(false);
                 //SetRumble(false);
-                var sent = Retry(() => SetReportMode(ReportMode.SimpleHID));
-                if (sent)
-                {
-                    Retry(() => SetPlayerLED(0));
-                }
-                
+                SetReportMode(ReportMode.SimpleHID);
+                SetPlayerLED(0);
+
                 // Commented because you need to restart the controller to reconnect in usb again with the following
                 //BTActivate();
             }
 
             if (close)
             {
-                HIDApi.Close(_handle);
-                _handle = IntPtr.Zero;
+                HidapiLock.EnterWriteLock();
+                try
+                {
+                    HIDApi.Close(_handle);
+                    _handle = IntPtr.Zero;
+                }
+                finally
+                {
+                    HidapiLock.ExitWriteLock();
+                }
             }
         }
 
         State = Status.NotAttached;
     }
 
-    public void Drop(bool error = false, bool waitThreads = true)
+    public void Drop(bool error = false)
     {
-        // when waitThreads is false, doesn't dispose the cancellation token
-        // so you have to call AbortCommunicationThreads again with waitThreads to true
-        AbortCommunicationThreads(waitThreads);
+        WaitCommunicationThreads();
 
         State = error ? Status.Errored : Status.Dropped;
     }
 
-    private void AbortCommunicationThreads(bool waitThreads = true)
+    private void WaitCommunicationThreads()
     {
-        lock (_ctsCommunicationsLock)
-        {
-            if (_ctsCommunications != null && !_ctsCommunications.IsCancellationRequested)
-            {
-                _ctsCommunications.Cancel();
-            }
-        }
-
-        if (waitThreads)
-        {
-            _receiveReportsThread?.Join();
-            _sendCommandsThread?.Join();
-
-            lock (_ctsCommunicationsLock)
-            {
-                if (_ctsCommunications != null)
-                {
-                    _ctsCommunications.Dispose();
-                    _ctsCommunications = null;
-                }
-            }
-        }
+        _ctsCommunications?.Cancel();
+        _receiveReportsThread?.Join();
+        _sendCommandsThread?.Join();
+        _ctsCommunications?.Dispose();
+        _ctsCommunications = null;
     }
 
     public bool IsViGEmSetup()
@@ -846,7 +808,7 @@ public class Joycon
             DebugPrint("Connect virtual xbox controller.", DebugType.Comms);
             OutXbox.Connect();
         }
-        
+
         if (Config.ShowAsDs4)
         {
             DebugPrint("Connect virtual DS4 controller.", DebugType.Comms);
@@ -938,7 +900,7 @@ public class Joycon
         // clear remaining of buffer just to be safe
         if (length < ReportLength)
         {
-            buf.Slice(length,  ReportLength - length).Clear();
+            buf.Slice(length, ReportLength - length).Clear();
         }
 
         const int nbPackets = 3;
@@ -958,7 +920,7 @@ public class Joycon
             var deltaPacketsMs = _avgReceiveDeltaMs.GetAverage() / nbPackets;
             deltaPacketsMicroseconds = (ulong)(deltaPacketsMs * 1000);
 
-             _AHRS.SamplePeriod = deltaPacketsMs / 1000;
+            _AHRS.SamplePeriod = deltaPacketsMs / 1000;
         }
 
         // Process packets as soon as they come
@@ -969,6 +931,7 @@ public class Joycon
             if (n == 0)
             {
                 ProcessButtonsAndStick(buf);
+                HandleMotionControls();
                 DoThingsWithButtons();
                 GetBatteryInfos(buf);
             }
@@ -994,39 +957,1547 @@ public class Joycon
         return ReceiveError.None;
     }
 
-    private void DetectShake()
+    private Button GetButtonForMotion(Button p1Button, Button p2Button)
     {
-        if (!Config.ShakeInputEnabled || !IsPrimaryGyro)
+        // PadId 0 and 1 are for P1, PadId 2 and 3 are for P2
+        bool isP1 = PadId < 2;
+        return isP1 ? p1Button : p2Button;
+    }
+
+    private enum SequentialPressState
+    {
+        Idle,
+        FirstPress,
+        BetweenFirstAndSecond,
+        SecondPress,
+        Cooldown
+    }
+
+    public enum PressType
+    {
+        Single,
+        Continuous,
+        Double,
+    }
+
+    // Existing variables (some have been updated)
+
+    // Enabled flags
+    private bool _leftGyroEnabled = true;
+    private bool _leftGyroZEnabled = false;
+    private bool _leftGyroZPlusEnabled = false;
+    private bool _leftGyroZMinusEnabled = false;
+    private bool _leftAccelEnabled = false;
+    private bool _leftAccelXEnabled = false;
+
+    private bool _rightGyroEnabled = true;
+    private bool _rightGyroZEnabled = false;
+    private bool _rightGyroZPlusEnabled = false;
+    private bool _rightGyroZMinusEnabled = false;
+    private bool _rightAccelEnabled = false;
+    private bool _rightAccelXEnabled = false;
+
+    // Combo enabled flags
+    private bool _leftGyroComboEnabled = false;
+    private bool _leftGyroZComboEnabled = false;
+    private bool _leftGyroZPlusComboEnabled = false;
+    private bool _leftGyroZMinusComboEnabled = false;
+    private bool _leftAccelComboEnabled = false;
+    private bool _leftAccelXComboEnabled = false;
+
+    private bool _rightGyroComboEnabled = false;
+    private bool _rightGyroZComboEnabled = false;
+    private bool _rightGyroZPlusComboEnabled = false;
+    private bool _rightGyroZMinusComboEnabled = false;
+    private bool _rightAccelComboEnabled = false;
+    private bool _rightAccelXComboEnabled = false;
+
+    // Heavy enabled flags
+    private bool _leftGyroHeavyEnabled = false;
+    private bool _leftGyroZHeavyEnabled = false;
+    private bool _leftGyroZPlusHeavyEnabled = false;
+    private bool _leftGyroZMinusHeavyEnabled = false;
+    private bool _leftAccelHeavyEnabled = false;
+    private bool _leftAccelXHeavyEnabled = false;
+
+    private bool _rightGyroHeavyEnabled = false;
+    private bool _rightGyroZHeavyEnabled = false;
+    private bool _rightGyroZPlusHeavyEnabled = false;
+    private bool _rightGyroZMinusHeavyEnabled = false;
+    private bool _rightAccelHeavyEnabled = false;
+    private bool _rightAccelXHeavyEnabled = false;
+
+    // Buttons
+    private Button _leftGyroButton = Button.A;
+    private Button _leftGyroZButton = Button.A;
+    private Button _leftGyroZPlusButton = Button.A;
+    private Button _leftGyroZMinusButton = Button.A;
+    private Button _leftAccelButton = Button.A;
+    private Button _leftAccelXButton = Button.A;
+
+    private Button _rightGyroButton = Button.B;
+    private Button _rightGyroZButton = Button.B;
+    private Button _rightGyroZPlusButton = Button.B;
+    private Button _rightGyroZMinusButton = Button.B;
+    private Button _rightAccelButton = Button.B;
+    private Button _rightAccelXButton = Button.B;
+
+    private Button _leftGyroButtonP1 = Button.A;
+    private Button _leftGyroZButtonP1 = Button.A;
+    private Button _leftGyroZPlusButtonP1 = Button.A;
+    private Button _leftGyroZMinusButtonP1 = Button.A;
+    private Button _leftAccelButtonP1 = Button.A;
+    private Button _leftAccelXButtonP1 = Button.A;
+    private Button _rightGyroButtonP1 = Button.B;
+    private Button _rightGyroZButtonP1 = Button.B;
+    private Button _rightGyroZPlusButtonP1 = Button.B;
+    private Button _rightGyroZMinusButtonP1 = Button.B;
+    private Button _rightAccelButtonP1 = Button.B;
+    private Button _rightAccelXButtonP1 = Button.B;
+
+    private Button _leftGyroButtonP2 = Button.Minus;
+    private Button _leftGyroZButtonP2 = Button.Minus;
+    private Button _leftGyroZPlusButtonP2 = Button.Minus;
+    private Button _leftGyroZMinusButtonP2 = Button.Minus;
+    private Button _leftAccelButtonP2 = Button.Minus;
+    private Button _leftAccelXButtonP2 = Button.Minus;
+    private Button _rightGyroButtonP2 = Button.Plus;
+    private Button _rightGyroZButtonP2 = Button.Plus;
+    private Button _rightGyroZPlusButtonP2 = Button.Plus;
+    private Button _rightGyroZMinusButtonP2 = Button.Plus;
+    private Button _rightAccelButtonP2 = Button.Plus;
+    private Button _rightAccelXButtonP2 = Button.Plus;
+
+    // Secondary buttons
+    private Button? _leftGyroSecondaryButton = null;
+    private Button? _leftGyroZSecondaryButton = null;
+    private Button? _leftGyroZPlusSecondaryButton = null;
+    private Button? _leftGyroZMinusSecondaryButton = null;
+    private Button? _leftAccelSecondaryButton = null;
+    private Button? _leftAccelXSecondaryButton = null;
+
+    private Button? _rightGyroSecondaryButton = null;
+    private Button? _rightGyroZSecondaryButton = null;
+    private Button? _rightGyroZPlusSecondaryButton = null;
+    private Button? _rightGyroZMinusSecondaryButton = null;
+    private Button? _rightAccelSecondaryButton = null;
+    private Button? _rightAccelXSecondaryButton = null;
+
+    // Secondary button delays
+    private long _leftGyroSecondaryButtonDelay = 0;
+    private long _leftGyroZSecondaryButtonDelay = 0;
+    private long _leftGyroZPlusSecondaryButtonDelay = 0;
+    private long _leftGyroZMinusSecondaryButtonDelay = 0;
+    private long _leftAccelSecondaryButtonDelay = 0;
+    private long _leftAccelXSecondaryButtonDelay = 0;
+
+    private long _rightGyroSecondaryButtonDelay = 0;
+    private long _rightGyroZSecondaryButtonDelay = 0;
+    private long _rightGyroZPlusSecondaryButtonDelay = 0;
+    private long _rightGyroZMinusSecondaryButtonDelay = 0;
+    private long _rightAccelSecondaryButtonDelay = 0;
+    private long _rightAccelXSecondaryButtonDelay = 0;
+
+    // Thresholds
+    private float _leftGyroThreshold = 100f;
+    private float _leftGyroZThreshold = 100f;
+    private float _leftGyroZPlusThreshold = 200f;
+    private float _leftGyroZMinusThreshold = 200f;
+    private float _leftAccelThreshold = 9991.0f;
+    private float _leftAccelXThreshold = 9991.0f;
+
+    private float _rightGyroThreshold = 100f;
+    private float _rightGyroZThreshold = 100f;
+    private float _rightGyroZPlusThreshold = 200f;
+    private float _rightGyroZMinusThreshold = 200f;
+    private float _rightAccelThreshold = 9991.0f;
+    private float _rightAccelXThreshold = 9991.0f;
+
+    // Cooldown durations
+    private long _leftGyroCooldownDuration = 300;
+    private long _leftGyroZCooldownDuration = 300;
+    private long _leftGyroZPlusCooldownDuration = 300;
+    private long _leftGyroZMinusCooldownDuration = 300;
+    private long _leftAccelCooldownDuration = 0;
+    private long _leftAccelXCooldownDuration = 0;
+
+    private long _rightGyroCooldownDuration = 100;
+    private long _rightGyroZCooldownDuration = 100;
+    private long _rightGyroZPlusCooldownDuration = 100;
+    private long _rightGyroZMinusCooldownDuration = 100;
+    private long _rightAccelCooldownDuration = 100;
+    private long _rightAccelXCooldownDuration = 100;
+
+    // External cooldown durations
+    private long _leftGyroExternalCooldownDuration = 100;
+    private long _leftGyroZExternalCooldownDuration = 100;
+    private long _leftGyroZPlusExternalCooldownDuration = 100;
+    private long _leftGyroZMinusExternalCooldownDuration = 100;
+    private long _leftAccelExternalCooldownDuration = 100;
+    private long _leftAccelXExternalCooldownDuration = 100;
+
+    private long _rightGyroExternalCooldownDuration = 100;
+    private long _rightGyroZExternalCooldownDuration = 100;
+    private long _rightGyroZPlusExternalCooldownDuration = 100;
+    private long _rightGyroZMinusExternalCooldownDuration = 100;
+    private long _rightAccelExternalCooldownDuration = 100;
+    private long _rightAccelXExternalCooldownDuration = 100;
+
+    // Press durations
+    private long _leftGyroPressDuration = 100;
+    private long _leftGyroZPressDuration = 100;
+    private long _leftGyroZPlusPressDuration = 100;
+    private long _leftGyroZMinusPressDuration = 100;
+    private long _leftAccelPressDuration = 100;
+    private long _leftAccelXPressDuration = 100;
+
+    private long _rightGyroPressDuration = 100;
+    private long _rightGyroZPressDuration = 100;
+    private long _rightGyroZPlusPressDuration = 100;
+    private long _rightGyroZMinusPressDuration = 100;
+    private long _rightAccelPressDuration = 100;
+    private long _rightAccelXPressDuration = 100;
+
+    // Press types
+    private PressType _leftGyroPressType = PressType.Single;
+    private PressType _leftGyroZPressType = PressType.Single;
+    private PressType _leftGyroZPlusPressType = PressType.Single;
+    private PressType _leftGyroZMinusPressType = PressType.Single;
+    private PressType _leftAccelPressType = PressType.Single;
+    private PressType _leftAccelXPressType = PressType.Single;
+
+    private PressType _rightGyroPressType = PressType.Single;
+    private PressType _rightGyroZPressType = PressType.Single;
+    private PressType _rightGyroZPlusPressType = PressType.Single;
+    private PressType _rightGyroZMinusPressType = PressType.Single;
+    private PressType _rightAccelPressType = PressType.Single;
+    private PressType _rightAccelXPressType = PressType.Single;
+
+    // Minimum breach times
+    private long _leftGyroMinBreachTime = 0;
+    private long _leftGyroZMinBreachTime = 0;
+    private long _leftGyroZPlusMinBreachTime = 0;
+    private long _leftGyroZMinusMinBreachTime = 0;
+    private long _leftAccelMinBreachTime = 0;
+    private long _leftAccelXMinBreachTime = 0;
+
+    private long _rightGyroMinBreachTime = 0;
+    private long _rightGyroZMinBreachTime = 0;
+    private long _rightGyroZPlusMinBreachTime = 0;
+    private long _rightGyroZMinusMinBreachTime = 0;
+    private long _rightAccelMinBreachTime = 0;
+    private long _rightAccelXMinBreachTime = 0;
+
+    // Combo buttons
+    private Button _leftGyroComboButton = Button.None;
+    private Button _leftGyroZComboButton = Button.None;
+    private Button _leftGyroZPlusComboButton = Button.None;
+    private Button _leftGyroZMinusComboButton = Button.None;
+    private Button _leftAccelComboButton = Button.None;
+    private Button _leftAccelXComboButton = Button.None;
+
+    private Button _rightGyroComboButton = Button.None;
+    private Button _rightGyroZComboButton = Button.None;
+    private Button _rightGyroZPlusComboButton = Button.None;
+    private Button _rightGyroZMinusComboButton = Button.None;
+    private Button _rightAccelComboButton = Button.None;
+    private Button _rightAccelXComboButton = Button.None;
+
+    // Combo pressed flags
+    private bool _leftGyroComboPressed = false, _leftGyroZComboPressed = false, _leftGyroZPlusComboPressed = false, _leftGyroZMinusComboPressed = false, _leftAccelComboPressed = false, _leftAccelXComboPressed = false,
+                 _rightGyroComboPressed = false, _rightGyroZComboPressed = false, _rightGyroZPlusComboPressed = false, _rightGyroZMinusComboPressed = false, _rightAccelComboPressed = false, _rightAccelXComboPressed = false;
+
+    // Combo start times
+    private long _leftGyroComboStartTime = 0;
+    private long _leftGyroZComboStartTime = 0;
+    private long _leftGyroZPlusComboStartTime = 0;
+    private long _leftGyroZMinusComboStartTime = 0;
+    private long _leftAccelComboStartTime = 0;
+    private long _leftAccelXComboStartTime = 0;
+
+    private long _rightGyroComboStartTime = 0;
+    private long _rightGyroZComboStartTime = 0;
+    private long _rightGyroZPlusComboStartTime = 0;
+    private long _rightGyroZMinusComboStartTime = 0;
+    private long _rightAccelComboStartTime = 0;
+    private long _rightAccelXComboStartTime = 0;
+
+    // Opposite threshold breached flags
+    private bool _leftGyroOppositeThresholdBreached = false, _leftGyroZOppositeThresholdBreached = false, _leftGyroZPlusOppositeThresholdBreached = false, _leftGyroZMinusOppositeThresholdBreached = false, _leftAccelOppositeThresholdBreached = false, _leftAccelXOppositeThresholdBreached = false,
+                _rightGyroOppositeThresholdBreached = false, _rightGyroZOppositeThresholdBreached = false, _rightGyroZPlusOppositeThresholdBreached = false, _rightGyroZMinusOppositeThresholdBreached = false, _rightAccelOppositeThresholdBreached = false, _rightAccelXOppositeThresholdBreached = false;
+
+    // Heavy press variables
+    private float _leftGyroHeavyThreshold = 0f;
+    private float _leftGyroZHeavyThreshold = 0f;
+    private float _leftGyroZPlusHeavyThreshold = 0f;
+    private float _leftGyroZMinusHeavyThreshold = 0f;
+    private float _leftAccelHeavyThreshold = 0f;
+    private float _leftAccelXHeavyThreshold = 0f;
+
+    private float _rightGyroHeavyThreshold = 0f;
+    private float _rightGyroZHeavyThreshold = 0f;
+    private float _rightGyroZPlusHeavyThreshold = 0f;
+    private float _rightGyroZMinusHeavyThreshold = 0f;
+    private float _rightAccelHeavyThreshold = 0f;
+    private float _rightAccelXHeavyThreshold = 0f;
+
+    // Heavy buttons
+    private Button _leftGyroHeavyButton = Button.None;
+    private Button _leftGyroZHeavyButton = Button.None;
+    private Button _leftGyroZPlusHeavyButton = Button.None;
+    private Button _leftGyroZMinusHeavyButton = Button.None;
+    private Button _leftAccelHeavyButton = Button.None;
+    private Button _leftAccelXHeavyButton = Button.None;
+
+    private Button _rightGyroHeavyButton = Button.None;
+    private Button _rightGyroZHeavyButton = Button.None;
+    private Button _rightGyroZPlusHeavyButton = Button.None;
+    private Button _rightGyroZMinusHeavyButton = Button.None;
+    private Button _rightAccelHeavyButton = Button.None;
+    private Button _rightAccelXHeavyButton = Button.None;
+
+    // Heavy start times
+    private long _leftGyroHeavyStartTime = 0, _leftGyroZHeavyStartTime = 0, _leftGyroZPlusHeavyStartTime = 0, _leftGyroZMinusHeavyStartTime = 0, _leftAccelHeavyStartTime = 0, _leftAccelXHeavyStartTime = 0,
+              _rightGyroHeavyStartTime = 0, _rightGyroZHeavyStartTime = 0, _rightGyroZPlusHeavyStartTime = 0, _rightGyroZMinusHeavyStartTime = 0, _rightAccelHeavyStartTime = 0, _rightAccelXHeavyStartTime = 0;
+
+    // Heavy pressed flags
+    private bool _leftGyroHeavyPressed = false, _leftGyroZHeavyPressed = false, _leftGyroZPlusHeavyPressed = false, _leftGyroZMinusHeavyPressed = false, _leftAccelHeavyPressed = false, _leftAccelXHeavyPressed = false,
+              _rightGyroHeavyPressed = false, _rightGyroZHeavyPressed = false, _rightGyroZPlusHeavyPressed = false, _rightGyroZMinusHeavyPressed = false, _rightAccelHeavyPressed = false, _rightAccelXHeavyPressed = false;
+
+    // Pressed flags
+    private bool _leftGyroPressed = false, _leftGyroZPressed = false, _leftGyroZPlusPressed = false, _leftGyroZMinusPressed = false, _leftAccelPressed = false, _leftAccelXPressed = false,
+              _rightGyroPressed = false, _rightGyroZPressed = false, _rightGyroZPlusPressed = false, _rightGyroZMinusPressed = false, _rightAccelPressed = false, _rightAccelXPressed = false;
+
+    // Last press times
+    private long _lastLeftGyroTime = 0, _lastLeftGyroZTime = 0, _lastLeftGyroZPlusTime = 0, _lastLeftGyroZMinusTime = 0, _lastLeftAccelTime = 0, _lastLeftAccelXTime = 0,
+             _lastRightGyroTime = 0, _lastRightGyroZTime = 0, _lastRightGyroZPlusTime = 0, _lastRightGyroZMinusTime = 0, _lastRightAccelTime = 0, _lastRightAccelXTime = 0;
+
+    // Last motion times
+    private long _lastLeftGyroMotionTime = 0, _lastLeftGyroZMotionTime = 0, _lastLeftGyroZPlusMotionTime = 0, _lastLeftGyroZMinusMotionTime = 0, _lastLeftAccelMotionTime = 0, _lastLeftAccelXMotionTime = 0,
+             _lastRightGyroMotionTime = 0, _lastRightGyroZMotionTime = 0, _lastRightGyroZPlusMotionTime = 0, _lastRightGyroZMinusMotionTime = 0, _lastRightAccelMotionTime = 0, _lastRightAccelXMotionTime = 0;
+
+    // Second press flags
+    private bool _leftGyroSecondPress = false, _leftGyroZSecondPress = false, _leftGyroZPlusSecondPress = false, _leftGyroZMinusSecondPress = false, _leftAccelSecondPress = false, _leftAccelXSecondPress = false,
+              _rightGyroSecondPress = false, _rightGyroZSecondPress = false, _rightGyroZPlusSecondPress = false, _rightGyroZMinusSecondPress = false, _rightAccelSecondPress = false, _rightAccelXSecondPress = false;
+
+    // Sequential press states
+    private SequentialPressState _leftGyroSequentialPressState = SequentialPressState.Idle, _leftGyroZSequentialPressState = SequentialPressState.Idle, _leftGyroZPlusSequentialPressState = SequentialPressState.Idle, _leftGyroZMinusSequentialPressState = SequentialPressState.Idle, _leftAccelSequentialPressState = SequentialPressState.Idle, _leftAccelXSequentialPressState = SequentialPressState.Idle,
+                                _rightGyroSequentialPressState = SequentialPressState.Idle, _rightGyroZSequentialPressState = SequentialPressState.Idle, _rightGyroZPlusSequentialPressState = SequentialPressState.Idle, _rightGyroZMinusSequentialPressState = SequentialPressState.Idle, _rightAccelSequentialPressState = SequentialPressState.Idle, _rightAccelXSequentialPressState = SequentialPressState.Idle;
+
+    // External cooldown times
+    private long _lastLeftGyroExternalCooldownTime = 0, _lastLeftGyroZExternalCooldownTime = 0, _lastLeftGyroZPlusExternalCooldownTime = 0, _lastLeftGyroZMinusExternalCooldownTime = 0, _lastLeftAccelExternalCooldownTime = 0, _lastLeftAccelXExternalCooldownTime = 0,
+             _lastRightGyroExternalCooldownTime = 0, _lastRightGyroZExternalCooldownTime = 0, _lastRightGyroZPlusExternalCooldownTime = 0, _lastRightGyroZMinusExternalCooldownTime = 0, _lastRightAccelExternalCooldownTime = 0, _lastRightAccelXExternalCooldownTime = 0;
+
+    // Breach start times
+    private long _leftGyroBreachStartTime = 0, _leftGyroZBreachStartTime = 0, _leftGyroZPlusBreachStartTime = 0, _leftGyroZMinusBreachStartTime = 0, _leftAccelBreachStartTime = 0, _leftAccelXBreachStartTime = 0,
+             _rightGyroBreachStartTime = 0, _rightGyroZBreachStartTime = 0, _rightGyroZPlusBreachStartTime = 0, _rightGyroZMinusBreachStartTime = 0, _rightAccelBreachStartTime = 0, _rightAccelXBreachStartTime = 0;
+
+    // Combo window
+    private long _comboWindow = 70; // milliseconds
+
+    // Heavy press window
+    private long _heavyPressWindow = 70; // milliseconds
+
+    // Methods to set enabled flags
+    public void SetGyroEnabled(bool isLeft, bool enabled)
+    {
+        if (isLeft)
+            _leftGyroEnabled = enabled;
+        else
+            _rightGyroEnabled = enabled;
+    }
+
+    public void SetAccelEnabled(bool isLeft, bool enabled)
+    {
+        if (isLeft)
+            _leftAccelEnabled = enabled;
+        else
+            _rightAccelEnabled = enabled;
+    }
+
+    public void SetGyroZEnabled(bool isLeft, bool enabled)
+    {
+        if (isLeft)
+            _leftGyroZEnabled = enabled;
+        else
+            _rightGyroZEnabled = enabled;
+    }
+
+    public void SetAccelXEnabled(bool isLeft, bool enabled)
+    {
+        if (isLeft)
+            _leftAccelXEnabled = enabled;
+        else
+            _rightAccelXEnabled = enabled;
+    }
+
+    // New methods to set gyroZPlus and gyroZMinus enabled flags
+    public void SetGyroZPlusEnabled(bool isLeft, bool enabled)
+    {
+        if (isLeft)
+            _leftGyroZPlusEnabled = enabled;
+        else
+            _rightGyroZPlusEnabled = enabled;
+    }
+
+    public void SetGyroZMinusEnabled(bool isLeft, bool enabled)
+    {
+        if (isLeft)
+            _leftGyroZMinusEnabled = enabled;
+        else
+            _rightGyroZMinusEnabled = enabled;
+    }
+
+    private void HandleMotionControls()
+    {
+        long currentTime = DateTimeOffset.Now.ToUnixTimeMilliseconds();
+
+        // Handle the current Joy-Con
+        HandleJoyconMotion(this, currentTime);
+
+        // Handle the other Joy-Con only if it exists
+        if (Other != null)
         {
-            _hasShaked = false;
+            HandleJoyconMotion(Other, currentTime);
+        }
+    }
+
+    private void HandleJoyconMotion(Joycon joycon, long currentTime)
+    {
+        if (joycon == null)
+        {
             return;
         }
 
-        var currentShakeTime = _shakeTimer.ElapsedMilliseconds;
+        // Get accelerometer and gyroscope data
+        Vector3 accel = joycon.GetAccel();
+        Vector3 gyro = joycon.GetGyro();
 
-        // If controller was shaked then release mapped key after a small delay to simulate a button press, then reset hasShaked
-        if (_hasShaked && currentShakeTime >= _shakedTime + 10)
+        // Process each motion control separately
+        ProcessMotionControl(joycon, currentTime, Axis.All, Direction.Both, gyro, accel);
+        ProcessMotionControl(joycon, currentTime, Axis.Z, Direction.Both, gyro, accel);
+        ProcessMotionControl(joycon, currentTime, Axis.Z, Direction.Positive, gyro, accel);
+        ProcessMotionControl(joycon, currentTime, Axis.Z, Direction.Negative, gyro, accel);
+        ProcessMotionControl(joycon, currentTime, Axis.X, Direction.Both, gyro, accel);
+    }
+
+    // New method to process individual motion controls
+    private void ProcessMotionControl(Joycon joycon, long currentTime, Axis axis, Direction direction, Vector3 gyro, Vector3 accel)
+    {
+        bool isLeft = joycon.IsLeft;
+
+        // Determine which control we're processing
+        bool gyroEnabled = false;
+        bool accelEnabled = false;
+        float gyroThreshold = 0f;
+        float accelThreshold = 0f;
+        float gyroHeavyThreshold = 0f;
+        float accelHeavyThreshold = 0f;
+        long gyroCooldownDuration = 0;
+        long accelCooldownDuration = 0;
+        long gyroExternalCooldownDuration = 0;
+        long accelExternalCooldownDuration = 0;
+        long gyroPressDuration = 0;
+        long accelPressDuration = 0;
+        long gyroMinBreachTime = 0;
+        long accelMinBreachTime = 0;
+        Button gyroButton = Button.None;
+        Button accelButton = Button.None;
+        Button gyroComboButton = Button.None;
+        Button accelComboButton = Button.None;
+        Button gyroHeavyButton = Button.None;
+        Button accelHeavyButton = Button.None;
+        bool gyroComboEnabled = false;
+        bool accelComboEnabled = false;
+        bool gyroHeavyEnabled = false;
+        bool accelHeavyEnabled = false;
+        Button? gyroSecondaryButton = null;
+        Button? accelSecondaryButton = null;
+        long gyroSecondaryButtonDelay = 0;
+        long accelSecondaryButtonDelay = 0;
+        PressType gyroPressType = PressType.Single;
+        PressType accelPressType = PressType.Single;
+
+        // References to shared variables
+        ref bool gyroPressed = ref _leftGyroPressed;
+        ref bool accelPressed = ref _leftAccelPressed;
+        ref long lastGyroTime = ref _lastLeftGyroTime;
+        ref long lastAccelTime = ref _lastLeftAccelTime;
+        ref long lastGyroMotionTime = ref _lastLeftGyroMotionTime;
+        ref long lastAccelMotionTime = ref _lastLeftAccelMotionTime;
+        ref bool gyroComboPressed = ref _leftGyroComboPressed;
+        ref bool accelComboPressed = ref _leftAccelComboPressed;
+        ref long gyroComboStartTime = ref _leftGyroComboStartTime;
+        ref long accelComboStartTime = ref _leftAccelComboStartTime;
+        ref bool gyroOppositeThresholdBreached = ref _leftGyroOppositeThresholdBreached;
+        ref bool accelOppositeThresholdBreached = ref _leftAccelOppositeThresholdBreached;
+        ref bool gyroHeavyPressed = ref _leftGyroHeavyPressed;
+        ref bool accelHeavyPressed = ref _leftAccelHeavyPressed;
+        ref long gyroHeavyStartTime = ref _leftGyroHeavyStartTime;
+        ref long accelHeavyStartTime = ref _leftAccelHeavyStartTime;
+        ref bool gyroSecondPress = ref _leftGyroSecondPress;
+        ref bool accelSecondPress = ref _leftAccelSecondPress;
+        ref SequentialPressState gyroSequentialPressState = ref _leftGyroSequentialPressState;
+        ref SequentialPressState accelSequentialPressState = ref _leftAccelSequentialPressState;
+        ref long lastGyroExternalCooldownTime = ref _lastLeftGyroExternalCooldownTime;
+        ref long lastAccelExternalCooldownTime = ref _lastLeftAccelExternalCooldownTime;
+        ref long gyroBreachStartTime = ref _leftGyroBreachStartTime;
+        ref long accelBreachStartTime = ref _leftAccelBreachStartTime;
+
+        // Set up variables based on axis, direction, and side
+        if (isLeft)
         {
-            _hasShaked = false;
-
-            // Mapped shake key up
-            Simulate(Settings.Value("shake"), false, true);
-            DebugPrint("Shake completed", DebugType.Shake);
+            if (axis == Axis.All && direction == Direction.Both)
+            {
+                // Existing code for leftGyro and leftAccel
+                gyroEnabled = _leftGyroEnabled;
+                accelEnabled = _leftAccelEnabled;
+                gyroThreshold = _leftGyroThreshold;
+                accelThreshold = _leftAccelThreshold;
+                gyroHeavyThreshold = _leftGyroHeavyThreshold;
+                accelHeavyThreshold = _leftAccelHeavyThreshold;
+                gyroCooldownDuration = _leftGyroCooldownDuration;
+                accelCooldownDuration = _leftAccelCooldownDuration;
+                gyroExternalCooldownDuration = _leftGyroExternalCooldownDuration;
+                accelExternalCooldownDuration = _leftAccelExternalCooldownDuration;
+                gyroPressDuration = _leftGyroPressDuration;
+                accelPressDuration = _leftAccelPressDuration;
+                gyroMinBreachTime = _leftGyroMinBreachTime;
+                accelMinBreachTime = _leftAccelMinBreachTime;
+                gyroButton = GetButtonForMotion(_leftGyroButtonP1, _leftGyroButtonP2);
+                accelButton = GetButtonForMotion(_leftAccelButtonP1, _leftAccelButtonP2);
+                gyroComboButton = _leftGyroComboButton;
+                accelComboButton = _leftAccelComboButton;
+                gyroHeavyButton = _leftGyroHeavyButton;
+                accelHeavyButton = _leftAccelHeavyButton;
+                gyroComboEnabled = _leftGyroComboEnabled;
+                accelComboEnabled = _leftAccelComboEnabled;
+                gyroHeavyEnabled = _leftGyroHeavyEnabled;
+                accelHeavyEnabled = _leftAccelHeavyEnabled;
+                gyroSecondaryButton = _leftGyroSecondaryButton;
+                accelSecondaryButton = _leftAccelSecondaryButton;
+                gyroSecondaryButtonDelay = _leftGyroSecondaryButtonDelay;
+                accelSecondaryButtonDelay = _leftAccelSecondaryButtonDelay;
+                gyroPressType = _leftGyroPressType;
+                accelPressType = _leftAccelPressType;
+                gyroPressed = ref _leftGyroPressed;
+                accelPressed = ref _leftAccelPressed;
+                lastGyroTime = ref _lastLeftGyroTime;
+                lastAccelTime = ref _lastLeftAccelTime;
+                lastGyroMotionTime = ref _lastLeftGyroMotionTime;
+                lastAccelMotionTime = ref _lastLeftAccelMotionTime;
+                gyroComboPressed = ref _leftGyroComboPressed;
+                accelComboPressed = ref _leftAccelComboPressed;
+                gyroComboStartTime = ref _leftGyroComboStartTime;
+                accelComboStartTime = ref _leftAccelComboStartTime;
+                gyroOppositeThresholdBreached = ref _leftGyroOppositeThresholdBreached;
+                accelOppositeThresholdBreached = ref _leftAccelOppositeThresholdBreached;
+                gyroHeavyPressed = ref _leftGyroHeavyPressed;
+                accelHeavyPressed = ref _leftAccelHeavyPressed;
+                gyroHeavyStartTime = ref _leftGyroHeavyStartTime;
+                accelHeavyStartTime = ref _leftAccelHeavyStartTime;
+                gyroSecondPress = ref _leftGyroSecondPress;
+                accelSecondPress = ref _leftAccelSecondPress;
+                gyroSequentialPressState = ref _leftGyroSequentialPressState;
+                accelSequentialPressState = ref _leftAccelSequentialPressState;
+                lastGyroExternalCooldownTime = ref _lastLeftGyroExternalCooldownTime;
+                lastAccelExternalCooldownTime = ref _lastLeftAccelExternalCooldownTime;
+                gyroBreachStartTime = ref _leftGyroBreachStartTime;
+                accelBreachStartTime = ref _leftAccelBreachStartTime;
+            }
+            else if (axis == Axis.Z && direction == Direction.Both)
+            {
+                // Existing code for leftGyroZ
+                gyroEnabled = _leftGyroZEnabled;
+                gyroThreshold = _leftGyroZThreshold;
+                gyroHeavyThreshold = _leftGyroZHeavyThreshold;
+                gyroCooldownDuration = _leftGyroZCooldownDuration;
+                gyroExternalCooldownDuration = _leftGyroZExternalCooldownDuration;
+                gyroPressDuration = _leftGyroZPressDuration;
+                gyroMinBreachTime = _leftGyroZMinBreachTime;
+                gyroButton = GetButtonForMotion(_leftGyroZButtonP1, _leftGyroZButtonP2);
+                gyroComboButton = _leftGyroZComboButton;
+                gyroHeavyButton = _leftGyroZHeavyButton;
+                gyroComboEnabled = _leftGyroZComboEnabled;
+                gyroHeavyEnabled = _leftGyroZHeavyEnabled;
+                gyroSecondaryButton = _leftGyroZSecondaryButton;
+                gyroSecondaryButtonDelay = _leftGyroZSecondaryButtonDelay;
+                gyroPressType = _leftGyroZPressType;
+                gyroPressed = ref _leftGyroZPressed;
+                lastGyroTime = ref _lastLeftGyroZTime;
+                lastGyroMotionTime = ref _lastLeftGyroZMotionTime;
+                gyroComboPressed = ref _leftGyroZComboPressed;
+                gyroComboStartTime = ref _leftGyroZComboStartTime;
+                gyroOppositeThresholdBreached = ref _leftGyroZOppositeThresholdBreached;
+                gyroHeavyPressed = ref _leftGyroZHeavyPressed;
+                gyroHeavyStartTime = ref _leftGyroZHeavyStartTime;
+                gyroSecondPress = ref _leftGyroZSecondPress;
+                gyroSequentialPressState = ref _leftGyroZSequentialPressState;
+                lastGyroExternalCooldownTime = ref _lastLeftGyroZExternalCooldownTime;
+                gyroBreachStartTime = ref _leftGyroZBreachStartTime;
+            }
+            else if (axis == Axis.Z && direction == Direction.Positive)
+            {
+                gyroEnabled = _leftGyroZPlusEnabled;
+                gyroThreshold = _leftGyroZPlusThreshold;
+                gyroHeavyThreshold = _leftGyroZPlusHeavyThreshold;
+                gyroCooldownDuration = _leftGyroZPlusCooldownDuration;
+                gyroExternalCooldownDuration = _leftGyroZPlusExternalCooldownDuration;
+                gyroPressDuration = _leftGyroZPlusPressDuration;
+                gyroMinBreachTime = _leftGyroZPlusMinBreachTime;
+                gyroButton = GetButtonForMotion(_leftGyroZPlusButtonP1, _leftGyroZPlusButtonP2);
+                gyroComboButton = _leftGyroZPlusComboButton;
+                gyroHeavyButton = _leftGyroZPlusHeavyButton;
+                gyroComboEnabled = _leftGyroZPlusComboEnabled;
+                gyroHeavyEnabled = _leftGyroZPlusHeavyEnabled;
+                gyroSecondaryButton = _leftGyroZPlusSecondaryButton;
+                gyroSecondaryButtonDelay = _leftGyroZPlusSecondaryButtonDelay;
+                gyroPressType = _leftGyroZPlusPressType;
+                gyroPressed = ref _leftGyroZPlusPressed;
+                lastGyroTime = ref _lastLeftGyroZPlusTime;
+                lastGyroMotionTime = ref _lastLeftGyroZPlusMotionTime;
+                gyroComboPressed = ref _leftGyroZPlusComboPressed;
+                gyroComboStartTime = ref _leftGyroZPlusComboStartTime;
+                gyroOppositeThresholdBreached = ref _leftGyroZPlusOppositeThresholdBreached;
+                gyroHeavyPressed = ref _leftGyroZPlusHeavyPressed;
+                gyroHeavyStartTime = ref _leftGyroZPlusHeavyStartTime;
+                gyroSecondPress = ref _leftGyroZPlusSecondPress;
+                gyroSequentialPressState = ref _leftGyroZPlusSequentialPressState;
+                lastGyroExternalCooldownTime = ref _lastLeftGyroZPlusExternalCooldownTime;
+                gyroBreachStartTime = ref _leftGyroZPlusBreachStartTime;
+            }
+            else if (axis == Axis.Z && direction == Direction.Negative)
+            {
+                gyroEnabled = _leftGyroZMinusEnabled;
+                gyroThreshold = _leftGyroZMinusThreshold;
+                gyroHeavyThreshold = _leftGyroZMinusHeavyThreshold;
+                gyroCooldownDuration = _leftGyroZMinusCooldownDuration;
+                gyroExternalCooldownDuration = _leftGyroZMinusExternalCooldownDuration;
+                gyroPressDuration = _leftGyroZMinusPressDuration;
+                gyroMinBreachTime = _leftGyroZMinusMinBreachTime;
+                gyroButton = _leftGyroZMinusButton;
+                gyroComboButton = _leftGyroZMinusComboButton;
+                gyroHeavyButton = _leftGyroZMinusHeavyButton;
+                gyroComboEnabled = _leftGyroZMinusComboEnabled;
+                gyroHeavyEnabled = _leftGyroZMinusHeavyEnabled;
+                gyroSecondaryButton = _leftGyroZMinusSecondaryButton;
+                gyroSecondaryButtonDelay = _leftGyroZMinusSecondaryButtonDelay;
+                gyroPressType = _leftGyroZMinusPressType;
+                gyroPressed = ref _leftGyroZMinusPressed;
+                lastGyroTime = ref _lastLeftGyroZMinusTime;
+                lastGyroMotionTime = ref _lastLeftGyroZMinusMotionTime;
+                gyroComboPressed = ref _leftGyroZMinusComboPressed;
+                gyroComboStartTime = ref _leftGyroZMinusComboStartTime;
+                gyroOppositeThresholdBreached = ref _leftGyroZMinusOppositeThresholdBreached;
+                gyroHeavyPressed = ref _leftGyroZMinusHeavyPressed;
+                gyroHeavyStartTime = ref _leftGyroZMinusHeavyStartTime;
+                gyroSecondPress = ref _leftGyroZMinusSecondPress;
+                gyroSequentialPressState = ref _leftGyroZMinusSequentialPressState;
+                lastGyroExternalCooldownTime = ref _lastLeftGyroZMinusExternalCooldownTime;
+                gyroBreachStartTime = ref _leftGyroZMinusBreachStartTime;
+            }
+            else if (axis == Axis.X && direction == Direction.Both)
+            {
+                // Existing code for leftAccelX
+                accelEnabled = _leftAccelXEnabled;
+                accelThreshold = _leftAccelXThreshold;
+                accelHeavyThreshold = _leftAccelXHeavyThreshold;
+                accelCooldownDuration = _leftAccelXCooldownDuration;
+                accelExternalCooldownDuration = _leftAccelXExternalCooldownDuration;
+                accelPressDuration = _leftAccelXPressDuration;
+                accelMinBreachTime = _leftAccelXMinBreachTime;
+                accelButton = _leftAccelXButton;
+                accelComboButton = _leftAccelXComboButton;
+                accelHeavyButton = _leftAccelXHeavyButton;
+                accelComboEnabled = _leftAccelXComboEnabled;
+                accelHeavyEnabled = _leftAccelXHeavyEnabled;
+                accelSecondaryButton = _leftAccelXSecondaryButton;
+                accelSecondaryButtonDelay = _leftAccelXSecondaryButtonDelay;
+                accelPressType = _leftAccelXPressType;
+                accelPressed = ref _leftAccelXPressed;
+                lastAccelTime = ref _lastLeftAccelXTime;
+                lastAccelMotionTime = ref _lastLeftAccelXMotionTime;
+                accelComboPressed = ref _leftAccelXComboPressed;
+                accelComboStartTime = ref _leftAccelXComboStartTime;
+                accelOppositeThresholdBreached = ref _leftAccelXOppositeThresholdBreached;
+                accelHeavyPressed = ref _leftAccelXHeavyPressed;
+                accelHeavyStartTime = ref _leftAccelXHeavyStartTime;
+                accelSecondPress = ref _leftAccelXSecondPress;
+                accelSequentialPressState = ref _leftAccelXSequentialPressState;
+                lastAccelExternalCooldownTime = ref _lastLeftAccelXExternalCooldownTime;
+                accelBreachStartTime = ref _leftAccelXBreachStartTime;
+            }
+        }
+        else // Right Joy-Con
+        {
+            if (axis == Axis.All && direction == Direction.Both)
+            {
+                // Existing code for rightGyro and rightAccel
+                gyroEnabled = _rightGyroEnabled;
+                accelEnabled = _rightAccelEnabled;
+                gyroThreshold = _rightGyroThreshold;
+                accelThreshold = _rightAccelThreshold;
+                gyroHeavyThreshold = _rightGyroHeavyThreshold;
+                accelHeavyThreshold = _rightAccelHeavyThreshold;
+                gyroCooldownDuration = _rightGyroCooldownDuration;
+                accelCooldownDuration = _rightAccelCooldownDuration;
+                gyroExternalCooldownDuration = _rightGyroExternalCooldownDuration;
+                accelExternalCooldownDuration = _rightAccelExternalCooldownDuration;
+                gyroPressDuration = _rightGyroPressDuration;
+                accelPressDuration = _rightAccelPressDuration;
+                gyroMinBreachTime = _rightGyroMinBreachTime;
+                accelMinBreachTime = _rightAccelMinBreachTime;
+                gyroButton = GetButtonForMotion(_rightGyroButtonP1, _rightGyroButtonP2);
+                accelButton = GetButtonForMotion(_rightAccelButtonP1, _rightAccelButtonP2);
+                gyroComboButton = _rightGyroComboButton;
+                accelComboButton = _rightAccelComboButton;
+                gyroHeavyButton = _rightGyroHeavyButton;
+                accelHeavyButton = _rightAccelHeavyButton;
+                gyroComboEnabled = _rightGyroComboEnabled;
+                accelComboEnabled = _rightAccelComboEnabled;
+                gyroHeavyEnabled = _rightGyroHeavyEnabled;
+                accelHeavyEnabled = _rightAccelHeavyEnabled;
+                gyroSecondaryButton = _rightGyroSecondaryButton;
+                accelSecondaryButton = _rightAccelSecondaryButton;
+                gyroSecondaryButtonDelay = _rightGyroSecondaryButtonDelay;
+                accelSecondaryButtonDelay = _rightAccelSecondaryButtonDelay;
+                gyroPressType = _rightGyroPressType;
+                accelPressType = _rightAccelPressType;
+                gyroPressed = ref _rightGyroPressed;
+                accelPressed = ref _rightAccelPressed;
+                lastGyroTime = ref _lastRightGyroTime;
+                lastAccelTime = ref _lastRightAccelTime;
+                lastGyroMotionTime = ref _lastRightGyroMotionTime;
+                lastAccelMotionTime = ref _lastRightAccelMotionTime;
+                gyroComboPressed = ref _rightGyroComboPressed;
+                accelComboPressed = ref _rightAccelComboPressed;
+                gyroComboStartTime = ref _rightGyroComboStartTime;
+                accelComboStartTime = ref _rightAccelComboStartTime;
+                gyroOppositeThresholdBreached = ref _rightGyroOppositeThresholdBreached;
+                accelOppositeThresholdBreached = ref _rightAccelOppositeThresholdBreached;
+                gyroHeavyPressed = ref _rightGyroHeavyPressed;
+                accelHeavyPressed = ref _rightAccelHeavyPressed;
+                gyroHeavyStartTime = ref _rightGyroHeavyStartTime;
+                accelHeavyStartTime = ref _rightAccelHeavyStartTime;
+                gyroSecondPress = ref _rightGyroSecondPress;
+                accelSecondPress = ref _rightAccelSecondPress;
+                gyroSequentialPressState = ref _rightGyroSequentialPressState;
+                accelSequentialPressState = ref _rightAccelSequentialPressState;
+                lastGyroExternalCooldownTime = ref _lastRightGyroExternalCooldownTime;
+                lastAccelExternalCooldownTime = ref _lastRightAccelExternalCooldownTime;
+                gyroBreachStartTime = ref _rightGyroBreachStartTime;
+                accelBreachStartTime = ref _rightAccelBreachStartTime;
+            }
+            else if (axis == Axis.Z && direction == Direction.Both)
+            {
+                // Existing code for rightGyroZ
+                gyroEnabled = _rightGyroZEnabled;
+                gyroThreshold = _rightGyroZThreshold;
+                gyroHeavyThreshold = _rightGyroZHeavyThreshold;
+                gyroCooldownDuration = _rightGyroZCooldownDuration;
+                gyroExternalCooldownDuration = _rightGyroZExternalCooldownDuration;
+                gyroPressDuration = _rightGyroZPressDuration;
+                gyroMinBreachTime = _rightGyroZMinBreachTime;
+                gyroButton = _rightGyroZButton;
+                gyroComboButton = _rightGyroZComboButton;
+                gyroHeavyButton = _rightGyroZHeavyButton;
+                gyroComboEnabled = _rightGyroZComboEnabled;
+                gyroHeavyEnabled = _rightGyroZHeavyEnabled;
+                gyroSecondaryButton = _rightGyroZSecondaryButton;
+                gyroSecondaryButtonDelay = _rightGyroZSecondaryButtonDelay;
+                gyroPressType = _rightGyroZPressType;
+                gyroPressed = ref _rightGyroZPressed;
+                lastGyroTime = ref _lastRightGyroZTime;
+                lastGyroMotionTime = ref _lastRightGyroZMotionTime;
+                gyroComboPressed = ref _rightGyroZComboPressed;
+                gyroComboStartTime = ref _rightGyroZComboStartTime;
+                gyroOppositeThresholdBreached = ref _rightGyroZOppositeThresholdBreached;
+                gyroHeavyPressed = ref _rightGyroZHeavyPressed;
+                gyroHeavyStartTime = ref _rightGyroZHeavyStartTime;
+                gyroSecondPress = ref _rightGyroZSecondPress;
+                gyroSequentialPressState = ref _rightGyroZSequentialPressState;
+                lastGyroExternalCooldownTime = ref _lastRightGyroZExternalCooldownTime;
+                gyroBreachStartTime = ref _rightGyroZBreachStartTime;
+            }
+            else if (axis == Axis.Z && direction == Direction.Positive)
+            {
+                gyroEnabled = _rightGyroZPlusEnabled;
+                gyroThreshold = _rightGyroZPlusThreshold;
+                gyroHeavyThreshold = _rightGyroZPlusHeavyThreshold;
+                gyroCooldownDuration = _rightGyroZPlusCooldownDuration;
+                gyroExternalCooldownDuration = _rightGyroZPlusExternalCooldownDuration;
+                gyroPressDuration = _rightGyroZPlusPressDuration;
+                gyroMinBreachTime = _rightGyroZPlusMinBreachTime;
+                gyroButton = _rightGyroZPlusButton;
+                gyroComboButton = _rightGyroZPlusComboButton;
+                gyroHeavyButton = _rightGyroZPlusHeavyButton;
+                gyroComboEnabled = _rightGyroZPlusComboEnabled;
+                gyroHeavyEnabled = _rightGyroZPlusHeavyEnabled;
+                gyroSecondaryButton = _rightGyroZPlusSecondaryButton;
+                gyroSecondaryButtonDelay = _rightGyroZPlusSecondaryButtonDelay;
+                gyroPressType = _rightGyroZPlusPressType;
+                gyroPressed = ref _rightGyroZPlusPressed;
+                lastGyroTime = ref _lastRightGyroZPlusTime;
+                lastGyroMotionTime = ref _lastRightGyroZPlusMotionTime;
+                gyroComboPressed = ref _rightGyroZPlusComboPressed;
+                gyroComboStartTime = ref _rightGyroZPlusComboStartTime;
+                gyroOppositeThresholdBreached = ref _rightGyroZPlusOppositeThresholdBreached;
+                gyroHeavyPressed = ref _rightGyroZPlusHeavyPressed;
+                gyroHeavyStartTime = ref _rightGyroZPlusHeavyStartTime;
+                gyroSecondPress = ref _rightGyroZPlusSecondPress;
+                gyroSequentialPressState = ref _rightGyroZPlusSequentialPressState;
+                lastGyroExternalCooldownTime = ref _lastRightGyroZPlusExternalCooldownTime;
+                gyroBreachStartTime = ref _rightGyroZPlusBreachStartTime;
+            }
+            else if (axis == Axis.Z && direction == Direction.Negative)
+            {
+                gyroEnabled = _rightGyroZMinusEnabled;
+                gyroThreshold = _rightGyroZMinusThreshold;
+                gyroHeavyThreshold = _rightGyroZMinusHeavyThreshold;
+                gyroCooldownDuration = _rightGyroZMinusCooldownDuration;
+                gyroExternalCooldownDuration = _rightGyroZMinusExternalCooldownDuration;
+                gyroPressDuration = _rightGyroZMinusPressDuration;
+                gyroMinBreachTime = _rightGyroZMinusMinBreachTime;
+                gyroButton = _rightGyroZMinusButton;
+                gyroComboButton = _rightGyroZMinusComboButton;
+                gyroHeavyButton = _rightGyroZMinusHeavyButton;
+                gyroComboEnabled = _rightGyroZMinusComboEnabled;
+                gyroHeavyEnabled = _rightGyroZMinusHeavyEnabled;
+                gyroSecondaryButton = _rightGyroZMinusSecondaryButton;
+                gyroSecondaryButtonDelay = _rightGyroZMinusSecondaryButtonDelay;
+                gyroPressType = _rightGyroZMinusPressType;
+                gyroPressed = ref _rightGyroZMinusPressed;
+                lastGyroTime = ref _lastRightGyroZMinusTime;
+                lastGyroMotionTime = ref _lastRightGyroZMinusMotionTime;
+                gyroComboPressed = ref _rightGyroZMinusComboPressed;
+                gyroComboStartTime = ref _rightGyroZMinusComboStartTime;
+                gyroOppositeThresholdBreached = ref _rightGyroZMinusOppositeThresholdBreached;
+                gyroHeavyPressed = ref _rightGyroZMinusHeavyPressed;
+                gyroHeavyStartTime = ref _rightGyroZMinusHeavyStartTime;
+                gyroSecondPress = ref _rightGyroZMinusSecondPress;
+                gyroSequentialPressState = ref _rightGyroZMinusSequentialPressState;
+                lastGyroExternalCooldownTime = ref _lastRightGyroZMinusExternalCooldownTime;
+                gyroBreachStartTime = ref _rightGyroZMinusBreachStartTime;
+            }
+            else if (axis == Axis.X && direction == Direction.Both)
+            {
+                // Existing code for rightAccelX
+                accelEnabled = _rightAccelXEnabled;
+                accelThreshold = _rightAccelXThreshold;
+                accelHeavyThreshold = _rightAccelXHeavyThreshold;
+                accelCooldownDuration = _rightAccelXCooldownDuration;
+                accelExternalCooldownDuration = _rightAccelXExternalCooldownDuration;
+                accelPressDuration = _rightAccelXPressDuration;
+                accelMinBreachTime = _rightAccelXMinBreachTime;
+                accelButton = _rightAccelXButton;
+                accelComboButton = _rightAccelXComboButton;
+                accelHeavyButton = _rightAccelXHeavyButton;
+                accelComboEnabled = _rightAccelXComboEnabled;
+                accelHeavyEnabled = _rightAccelXHeavyEnabled;
+                accelSecondaryButton = _rightAccelXSecondaryButton;
+                accelSecondaryButtonDelay = _rightAccelXSecondaryButtonDelay;
+                accelPressType = _rightAccelXPressType;
+                accelPressed = ref _rightAccelXPressed;
+                lastAccelTime = ref _lastRightAccelXTime;
+                lastAccelMotionTime = ref _lastRightAccelXMotionTime;
+                accelComboPressed = ref _rightAccelXComboPressed;
+                accelComboStartTime = ref _rightAccelXComboStartTime;
+                accelOppositeThresholdBreached = ref _rightAccelXOppositeThresholdBreached;
+                accelHeavyPressed = ref _rightAccelXHeavyPressed;
+                accelHeavyStartTime = ref _rightAccelXHeavyStartTime;
+                accelSecondPress = ref _rightAccelXSecondPress;
+                accelSequentialPressState = ref _rightAccelXSequentialPressState;
+                lastAccelExternalCooldownTime = ref _lastRightAccelXExternalCooldownTime;
+                accelBreachStartTime = ref _rightAccelXBreachStartTime;
+            }
         }
 
-        if (!_hasShaked)
+        // Return early if both gyro and accel are disabled
+        if (!gyroEnabled && !accelEnabled)
         {
-            // Shake detection logic
-            var isShaking = GetAccel().LengthSquared() >= Config.ShakeSensitivity;
-            if (isShaking && (currentShakeTime >= _shakedTime + Config.ShakeDelay || _shakedTime == 0))
-            {
-                _shakedTime = currentShakeTime;
-                _hasShaked = true;
+            return;
+        }
 
-                // Mapped shake key down
-                Simulate(Settings.Value("shake"), false);
-                DebugPrint("Shaked at time: " + _shakedTime, DebugType.Shake);
+        // Determine if thresholds are breached
+        bool gyroThresholdBreached = false;
+        bool accelThresholdBreached = false;
+        bool gyroHeavyThresholdBreached = false;
+        bool accelHeavyThresholdBreached = false;
+
+        if (gyroEnabled)
+        {
+            float gyroValue = 0f;
+            float gyroOppositeValue = 0f;
+
+            if (axis == Axis.All)
+            {
+                gyroValue = Math.Max(Math.Max(Math.Abs(gyro.X), Math.Abs(gyro.Y)), Math.Abs(gyro.Z));
             }
+            else if (axis == Axis.Z)
+            {
+                if (direction == Direction.Positive)
+                {
+                    gyroValue = gyro.Z > 0 ? gyro.Z : 0;
+                }
+                else if (direction == Direction.Negative)
+                {
+                    gyroValue = gyro.Z < 0 ? -gyro.Z : 0;
+                }
+                else // Direction.Both
+                {
+                    gyroValue = Math.Abs(gyro.Z);
+                }
+                gyroOppositeValue = gyro.Z;
+            }
+
+            gyroThresholdBreached = gyroValue > gyroThreshold;
+            gyroHeavyThresholdBreached = gyroValue > gyroHeavyThreshold;
+        }
+
+        if (accelEnabled)
+        {
+            float accelValue = 0f;
+            float accelOppositeValue = 0f;
+
+            if (axis == Axis.All)
+            {
+                accelValue = Math.Max(Math.Max(Math.Abs(accel.X), Math.Abs(accel.Y)), Math.Abs(accel.Z));
+            }
+            else if (axis == Axis.X)
+            {
+                accelValue = Math.Abs(accel.X);
+                accelOppositeValue = accel.X;
+            }
+
+            accelThresholdBreached = accelValue > accelThreshold;
+            accelHeavyThresholdBreached = accelValue > accelHeavyThreshold;
+        }
+
+        // Update breach start times
+        if (gyroEnabled && gyroThresholdBreached)
+        {
+            if (gyroBreachStartTime == 0)
+            {
+                gyroBreachStartTime = currentTime;
+            }
+        }
+        else
+        {
+            gyroBreachStartTime = 0;
+        }
+
+        if (accelEnabled && accelThresholdBreached)
+        {
+            if (accelBreachStartTime == 0)
+            {
+                accelBreachStartTime = currentTime;
+            }
+        }
+        else
+        {
+            accelBreachStartTime = 0;
+        }
+
+        // Set opposite threshold breach flags for combo feature
+        if (axis == Axis.Z && gyroEnabled)
+        {
+            if (isLeft)
+            {
+                gyroOppositeThresholdBreached = false;
+                if (direction == Direction.Positive)
+                {
+                    gyroOppositeThresholdBreached = _rightGyroZMinusBreachStartTime > 0 && (currentTime - _rightGyroZMinusBreachStartTime <= _comboWindow);
+                }
+                else if (direction == Direction.Negative)
+                {
+                    gyroOppositeThresholdBreached = _rightGyroZPlusBreachStartTime > 0 && (currentTime - _rightGyroZPlusBreachStartTime <= _comboWindow);
+                }
+            }
+            else
+            {
+                gyroOppositeThresholdBreached = false;
+                if (direction == Direction.Positive)
+                {
+                    gyroOppositeThresholdBreached = _leftGyroZMinusBreachStartTime > 0 && (currentTime - _leftGyroZMinusBreachStartTime <= _comboWindow);
+                }
+                else if (direction == Direction.Negative)
+                {
+                    gyroOppositeThresholdBreached = _leftGyroZPlusBreachStartTime > 0 && (currentTime - _leftGyroZPlusBreachStartTime <= _comboWindow);
+                }
+            }
+        }
+
+        // Check if minimum breach times have been met
+        bool gyroDetected = gyroEnabled && gyroThresholdBreached &&
+            (currentTime - gyroBreachStartTime >= gyroMinBreachTime);
+
+        bool accelDetected = accelEnabled && accelThresholdBreached &&
+            (currentTime - accelBreachStartTime >= accelMinBreachTime);
+
+        // Check external cooldowns
+        bool gyroAllowed = currentTime - lastGyroExternalCooldownTime >= gyroExternalCooldownDuration;
+        bool accelAllowed = currentTime - lastAccelExternalCooldownTime >= accelExternalCooldownDuration;
+
+        // Handle gyro motion
+        if (gyroDetected && gyroAllowed)
+        {
+            HandleMotionForButton(isLeft, true, currentTime,
+                ref gyroPressed, ref lastGyroTime, ref lastGyroMotionTime,
+                gyroButton,
+                gyroComboButton, ref gyroComboPressed, ref gyroComboStartTime, gyroOppositeThresholdBreached, gyroComboEnabled,
+                gyroHeavyButton, gyroHeavyThreshold, ref gyroHeavyPressed, ref gyroHeavyStartTime, gyroHeavyThresholdBreached, gyroHeavyEnabled,
+                gyroSecondaryButton, gyroSecondaryButtonDelay,
+                gyroPressDuration, gyroCooldownDuration, gyroPressType, ref gyroSecondPress, ref gyroSequentialPressState);
+
+            // Trigger external cooldown
+            lastGyroExternalCooldownTime = currentTime;
+        }
+
+        // Handle accel motion
+        if (accelDetected && accelAllowed)
+        {
+            HandleMotionForButton(isLeft, true, currentTime,
+                ref accelPressed, ref lastAccelTime, ref lastAccelMotionTime,
+                accelButton,
+                accelComboButton, ref accelComboPressed, ref accelComboStartTime, accelOppositeThresholdBreached, accelComboEnabled,
+                accelHeavyButton, accelHeavyThreshold, ref accelHeavyPressed, ref accelHeavyStartTime, accelHeavyThresholdBreached, accelHeavyEnabled,
+                accelSecondaryButton, accelSecondaryButtonDelay,
+                accelPressDuration, accelCooldownDuration, accelPressType, ref accelSecondPress, ref accelSequentialPressState);
+
+            // Trigger external cooldown
+            lastAccelExternalCooldownTime = currentTime;
+        }
+
+        // Handle button releases
+        if (!gyroDetected || !gyroAllowed)
+        {
+            HandleMotionForButton(isLeft, false, currentTime,
+                ref gyroPressed, ref lastGyroTime, ref lastGyroMotionTime,
+                gyroButton,
+                gyroComboButton, ref gyroComboPressed, ref gyroComboStartTime, gyroOppositeThresholdBreached, gyroComboEnabled,
+                gyroHeavyButton, gyroHeavyThreshold, ref gyroHeavyPressed, ref gyroHeavyStartTime, gyroHeavyThresholdBreached, gyroHeavyEnabled,
+                gyroSecondaryButton, gyroSecondaryButtonDelay,
+                gyroPressDuration, gyroCooldownDuration, gyroPressType, ref gyroSecondPress, ref gyroSequentialPressState);
+        }
+
+        if (!accelDetected || !accelAllowed)
+        {
+            HandleMotionForButton(isLeft, false, currentTime,
+                ref accelPressed, ref lastAccelTime, ref lastAccelMotionTime,
+                accelButton,
+                accelComboButton, ref accelComboPressed, ref accelComboStartTime, accelOppositeThresholdBreached, accelComboEnabled,
+                accelHeavyButton, accelHeavyThreshold, ref accelHeavyPressed, ref accelHeavyStartTime, accelHeavyThresholdBreached, accelHeavyEnabled,
+                accelSecondaryButton, accelSecondaryButtonDelay,
+                accelPressDuration, accelCooldownDuration, accelPressType, ref accelSecondPress, ref accelSequentialPressState);
+        }
+    }
+
+    private void HandleMotionForButton(bool isLeft, bool motionDetected, long currentTime,
+        ref bool buttonPressed, ref long lastPressTime, ref long lastMotionTime,
+        Button primaryButton,
+        Button comboButton, ref bool comboPressed, ref long comboStartTime, bool oppositeThresholdBreached, bool comboEnabled,
+        Button heavyButton, float heavyThreshold, ref bool heavyPressed, ref long heavyStartTime, bool heavyThresholdBreached, bool heavyEnabled,
+        Button? secondaryButton, long secondaryButtonDelay, long pressDuration, long cooldownDuration,
+        PressType pressType, ref bool secondPress, ref SequentialPressState sequentialPressState)
+    {
+        switch (pressType)
+        {
+            case PressType.Single:
+                HandleSinglePress(motionDetected, ref buttonPressed, ref lastPressTime,
+                    primaryButton,
+                    comboButton, ref comboPressed, ref comboStartTime, oppositeThresholdBreached, comboEnabled,
+                    heavyButton, heavyThreshold, ref heavyPressed, ref heavyStartTime, heavyThresholdBreached, heavyEnabled,
+                    secondaryButton, secondaryButtonDelay,
+                    pressDuration, cooldownDuration, currentTime);
+                break;
+            case PressType.Continuous:
+                HandleContinuousPress(motionDetected, ref buttonPressed, ref lastPressTime, ref lastMotionTime,
+                    primaryButton,
+                    comboButton, ref comboPressed, ref comboStartTime, oppositeThresholdBreached, comboEnabled,
+                    heavyButton, heavyThreshold, ref heavyPressed, ref heavyStartTime, heavyThresholdBreached, heavyEnabled,
+                    secondaryButton, secondaryButtonDelay,
+                    pressDuration, cooldownDuration, currentTime);
+                break;
+            case PressType.Double:
+                HandleDoublePress(motionDetected, ref buttonPressed, ref lastPressTime,
+                    primaryButton,
+                    comboButton, ref comboPressed, ref comboStartTime, oppositeThresholdBreached, comboEnabled,
+                    heavyButton, heavyThreshold, ref heavyPressed, ref heavyStartTime, heavyThresholdBreached, heavyEnabled,
+                    secondaryButton, secondaryButtonDelay,
+                    pressDuration, cooldownDuration, currentTime, ref sequentialPressState);
+                break;
+        }
+    }
+
+    private void HandleSinglePress(bool motionDetected, ref bool buttonPressed, ref long lastPressTime,
+        Button primaryButton,
+        Button comboButton, ref bool comboPressed, ref long comboStartTime, bool oppositeThresholdBreached, bool comboEnabled,
+        Button heavyButton, float heavyThreshold, ref bool heavyPressed, ref long heavyStartTime, bool heavyThresholdBreached, bool heavyEnabled,
+        Button? secondaryButton, long secondaryButtonDelay, long pressDuration, long cooldownDuration, long currentTime)
+    {
+        // Removed the local declaration of heavyEnabled
+        if (!buttonPressed && !comboPressed && !heavyPressed)
+        {
+            bool cooldownComplete = currentTime - lastPressTime >= (pressDuration + cooldownDuration);
+
+            if (motionDetected && cooldownComplete)
+            {
+                if (comboEnabled && comboStartTime == 0)
+                {
+                    // Start the combo window
+                    comboStartTime = currentTime;
+                }
+                else if (heavyEnabled && heavyStartTime == 0)
+                {
+                    // Start the heavy press window
+                    heavyStartTime = currentTime;
+                }
+                else if (!comboEnabled && !heavyEnabled)
+                {
+                    // Regular press when neither combo nor heavy is enabled
+                    PressButtons(primaryButton, secondaryButton, secondaryButtonDelay);
+                    buttonPressed = true;
+                    lastPressTime = currentTime;
+                }
+            }
+
+            // Handle combo press detection
+            if (comboEnabled)
+            {
+                if (oppositeThresholdBreached && comboStartTime != 0 && (currentTime - comboStartTime <= _comboWindow))
+                {
+                    // Opposite threshold breached within the window
+                    PressButtons(comboButton, secondaryButton, secondaryButtonDelay);
+                    comboPressed = true;
+                    lastPressTime = currentTime;
+                    comboStartTime = 0;
+                }
+                else if (comboStartTime != 0 && (currentTime - comboStartTime > _comboWindow))
+                {
+                    // Combo window expired without opposite threshold breach
+                    if (heavyEnabled && heavyStartTime == 0)
+                    {
+                        // Start heavy press window
+                        heavyStartTime = currentTime;
+                    }
+                    else if (!heavyEnabled)
+                    {
+                        // Trigger regular press
+                        PressButtons(primaryButton, secondaryButton, secondaryButtonDelay);
+                        buttonPressed = true;
+                        lastPressTime = currentTime;
+                        comboStartTime = 0;
+                    }
+                }
+            }
+
+            // Handle heavy press detection
+            if (heavyEnabled)
+            {
+                if (heavyThresholdBreached && heavyStartTime != 0 && (currentTime - heavyStartTime <= _heavyPressWindow))
+                {
+                    // Heavy press detected within the window
+                    PressButtons(heavyButton, secondaryButton, secondaryButtonDelay);
+                    heavyPressed = true;
+                    lastPressTime = currentTime;
+                    heavyStartTime = 0;
+                }
+                else if (heavyStartTime != 0 && (currentTime - heavyStartTime > _heavyPressWindow))
+                {
+                    // Heavy press window expired without heavy press
+                    PressButtons(primaryButton, secondaryButton, secondaryButtonDelay);
+                    buttonPressed = true;
+                    lastPressTime = currentTime;
+                    heavyStartTime = 0;
+                }
+            }
+        }
+        else if (buttonPressed || comboPressed || heavyPressed)
+        {
+            // Release the button after pressDuration
+            if (currentTime - lastPressTime >= pressDuration)
+            {
+                if (comboPressed)
+                {
+                    ReleaseButtons(comboButton, secondaryButton, secondaryButtonDelay);
+                    comboPressed = false;
+                }
+                else if (heavyPressed)
+                {
+                    ReleaseButtons(heavyButton, secondaryButton, secondaryButtonDelay);
+                    heavyPressed = false;
+                }
+                else
+                {
+                    ReleaseButtons(primaryButton, secondaryButton, secondaryButtonDelay);
+                    buttonPressed = false;
+                }
+            }
+        }
+
+        // Reset windows if motion stops and we're outside the respective windows without any press
+        if (!motionDetected)
+        {
+            if (comboStartTime != 0 && (currentTime - comboStartTime > _comboWindow))
+            {
+                comboStartTime = 0;
+            }
+            if (heavyStartTime != 0 && (currentTime - heavyStartTime > _heavyPressWindow))
+            {
+                heavyStartTime = 0;
+            }
+        }
+    }
+
+    private void HandleContinuousPress(bool motionDetected, ref bool buttonPressed, ref long lastPressTime, ref long lastMotionTime,
+        Button primaryButton,
+        Button comboButton, ref bool comboPressed, ref long comboStartTime, bool oppositeThresholdBreached, bool comboEnabled,
+        Button heavyButton, float heavyThreshold, ref bool heavyPressed, ref long heavyStartTime, bool heavyThresholdBreached, bool heavyEnabled,
+        Button? secondaryButton, long secondaryButtonDelay, long pressDuration, long cooldownDuration, long currentTime)
+    {
+        // Removed the local declaration of heavyEnabled
+
+        if (motionDetected)
+        {
+            lastMotionTime = currentTime;
+            bool cooldownComplete = currentTime - lastPressTime >= (pressDuration + cooldownDuration);
+
+            if (!buttonPressed && !comboPressed && !heavyPressed && cooldownComplete)
+            {
+                if (comboEnabled)
+                {
+                    if (comboStartTime == 0)
+                    {
+                        comboStartTime = currentTime;
+                    }
+
+                    if (oppositeThresholdBreached && (currentTime - comboStartTime) <= _comboWindow)
+                    {
+                        // Opposite threshold breached within the window
+                        PressButtons(comboButton, secondaryButton, secondaryButtonDelay);
+                        comboPressed = true;
+                        lastPressTime = currentTime;
+                    }
+                    else if ((currentTime - comboStartTime) > _comboWindow)
+                    {
+                        if (heavyEnabled && heavyStartTime == 0)
+                        {
+                            heavyStartTime = currentTime;
+                        }
+                        else if (!heavyEnabled)
+                        {
+                            // Regular press
+                            PressButtons(primaryButton, secondaryButton, secondaryButtonDelay);
+                            buttonPressed = true;
+                            lastPressTime = currentTime;
+                        }
+                    }
+                }
+                else if (heavyEnabled)
+                {
+                    if (heavyStartTime == 0)
+                    {
+                        heavyStartTime = currentTime;
+                    }
+
+                    if (heavyThresholdBreached && (currentTime - heavyStartTime) <= _heavyPressWindow)
+                    {
+                        // Heavy press detected within the window
+                        PressButtons(heavyButton, secondaryButton, secondaryButtonDelay);
+                        heavyPressed = true;
+                        lastPressTime = currentTime;
+                    }
+                    else if ((currentTime - heavyStartTime) > _heavyPressWindow)
+                    {
+                        // Regular press
+                        PressButtons(primaryButton, secondaryButton, secondaryButtonDelay);
+                        buttonPressed = true;
+                        lastPressTime = currentTime;
+                    }
+                }
+                else
+                {
+                    // Regular press when neither combo nor heavy is enabled
+                    PressButtons(primaryButton, secondaryButton, secondaryButtonDelay);
+                    buttonPressed = true;
+                    lastPressTime = currentTime;
+                }
+            }
+        }
+        else if ((buttonPressed || comboPressed || heavyPressed) && (currentTime - lastMotionTime) >= pressDuration)
+        {
+            if (comboPressed)
+            {
+                ReleaseButtons(comboButton, secondaryButton, secondaryButtonDelay);
+                comboPressed = false;
+            }
+            else if (heavyPressed)
+            {
+                ReleaseButtons(heavyButton, secondaryButton, secondaryButtonDelay);
+                heavyPressed = false;
+            }
+            else
+            {
+                ReleaseButtons(primaryButton, secondaryButton, secondaryButtonDelay);
+                buttonPressed = false;
+            }
+            comboStartTime = 0;
+            heavyStartTime = 0;
+        }
+    }
+
+    private void HandleDoublePress(bool motionDetected, ref bool buttonPressed, ref long lastPressTime,
+        Button primaryButton,
+        Button comboButton, ref bool comboPressed, ref long comboStartTime, bool oppositeThresholdBreached, bool comboEnabled,
+        Button heavyButton, float heavyThreshold, ref bool heavyPressed, ref long heavyStartTime, bool heavyThresholdBreached, bool heavyEnabled,
+        Button? secondaryButton, long secondaryButtonDelay, long pressDuration, long cooldownDuration,
+        long currentTime, ref SequentialPressState state)
+    {
+        // Removed the local declaration of heavyEnabled
+        const long gapBetweenPresses = 75; // ms
+
+        switch (state)
+        {
+            case SequentialPressState.Idle:
+                if (motionDetected && (currentTime - lastPressTime >= (pressDuration + cooldownDuration)))
+                {
+                    if (comboEnabled)
+                    {
+                        comboStartTime = currentTime;
+                    }
+                    else if (heavyEnabled)
+                    {
+                        heavyStartTime = currentTime;
+                    }
+                    state = SequentialPressState.FirstPress;
+                }
+                break;
+
+            case SequentialPressState.FirstPress:
+                if (comboEnabled)
+                {
+                    if (currentTime - comboStartTime > _comboWindow)
+                    {
+                        bool isComboPress = oppositeThresholdBreached;
+                        if (isComboPress)
+                        {
+                            PressButtons(comboButton, secondaryButton, secondaryButtonDelay);
+                            comboPressed = true;
+                        }
+                        else if (heavyEnabled)
+                        {
+                            if (currentTime - heavyStartTime > _heavyPressWindow)
+                            {
+                                bool isHeavyPress = heavyThresholdBreached;
+                                if (isHeavyPress)
+                                {
+                                    PressButtons(heavyButton, secondaryButton, secondaryButtonDelay);
+                                    heavyPressed = true;
+                                }
+                                else
+                                {
+                                    PressButtons(primaryButton, secondaryButton, secondaryButtonDelay);
+                                    buttonPressed = true;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            PressButtons(primaryButton, secondaryButton, secondaryButtonDelay);
+                            buttonPressed = true;
+                        }
+                        lastPressTime = currentTime;
+                        state = SequentialPressState.BetweenFirstAndSecond;
+                    }
+                }
+                else if (heavyEnabled)
+                {
+                    if (currentTime - heavyStartTime > _heavyPressWindow)
+                    {
+                        bool isHeavyPress = heavyThresholdBreached;
+                        if (isHeavyPress)
+                        {
+                            PressButtons(heavyButton, secondaryButton, secondaryButtonDelay);
+                            heavyPressed = true;
+                        }
+                        else
+                        {
+                            PressButtons(primaryButton, secondaryButton, secondaryButtonDelay);
+                            buttonPressed = true;
+                        }
+                        lastPressTime = currentTime;
+                        state = SequentialPressState.BetweenFirstAndSecond;
+                    }
+                }
+                else
+                {
+                    PressButtons(primaryButton, secondaryButton, secondaryButtonDelay);
+                    buttonPressed = true;
+                    lastPressTime = currentTime;
+                    state = SequentialPressState.BetweenFirstAndSecond;
+                }
+                break;
+
+            case SequentialPressState.BetweenFirstAndSecond:
+                if (currentTime - lastPressTime >= pressDuration)
+                {
+                    if (comboPressed)
+                    {
+                        ReleaseButtons(comboButton, secondaryButton, secondaryButtonDelay);
+                        comboPressed = false;
+                    }
+                    else if (heavyPressed)
+                    {
+                        ReleaseButtons(heavyButton, secondaryButton, secondaryButtonDelay);
+                        heavyPressed = false;
+                    }
+                    else
+                    {
+                        ReleaseButtons(primaryButton, secondaryButton, secondaryButtonDelay);
+                        buttonPressed = false;
+                    }
+
+                    if (motionDetected && (currentTime - lastPressTime >= (pressDuration + gapBetweenPresses)))
+                    {
+                        if (comboEnabled)
+                        {
+                            comboStartTime = currentTime;
+                        }
+                        else if (heavyEnabled)
+                        {
+                            heavyStartTime = currentTime;
+                        }
+                        state = SequentialPressState.SecondPress;
+                    }
+                    else if (currentTime - lastPressTime >= (pressDuration + cooldownDuration))
+                    {
+                        state = SequentialPressState.Idle;
+                    }
+                }
+                break;
+
+            case SequentialPressState.SecondPress:
+                if (comboEnabled)
+                {
+                    if (currentTime - comboStartTime > _comboWindow)
+                    {
+                        bool isComboPress = oppositeThresholdBreached;
+                        if (isComboPress)
+                        {
+                            PressButtons(comboButton, secondaryButton, secondaryButtonDelay);
+                            comboPressed = true;
+                        }
+                        else if (heavyEnabled)
+                        {
+                            if (currentTime - heavyStartTime > _heavyPressWindow)
+                            {
+                                bool isHeavyPress = heavyThresholdBreached;
+                                if (isHeavyPress)
+                                {
+                                    PressButtons(heavyButton, secondaryButton, secondaryButtonDelay);
+                                    heavyPressed = true;
+                                }
+                                else
+                                {
+                                    PressButtons(primaryButton, secondaryButton, secondaryButtonDelay);
+                                    buttonPressed = true;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            PressButtons(primaryButton, secondaryButton, secondaryButtonDelay);
+                            buttonPressed = true;
+                        }
+                        lastPressTime = currentTime;
+                        state = SequentialPressState.Cooldown;
+                    }
+                }
+                else if (heavyEnabled)
+                {
+                    if (currentTime - heavyStartTime > _heavyPressWindow)
+                    {
+                        bool isHeavyPress = heavyThresholdBreached;
+                        if (isHeavyPress)
+                        {
+                            PressButtons(heavyButton, secondaryButton, secondaryButtonDelay);
+                            heavyPressed = true;
+                        }
+                        else
+                        {
+                            PressButtons(primaryButton, secondaryButton, secondaryButtonDelay);
+                            buttonPressed = true;
+                        }
+                        lastPressTime = currentTime;
+                        state = SequentialPressState.Cooldown;
+                    }
+                }
+                else
+                {
+                    PressButtons(primaryButton, secondaryButton, secondaryButtonDelay);
+                    buttonPressed = true;
+                    lastPressTime = currentTime;
+                    state = SequentialPressState.Cooldown;
+                }
+                break;
+
+            case SequentialPressState.Cooldown:
+                if (currentTime - lastPressTime >= pressDuration)
+                {
+                    if (comboPressed)
+                    {
+                        ReleaseButtons(comboButton, secondaryButton, secondaryButtonDelay);
+                        comboPressed = false;
+                    }
+                    else if (heavyPressed)
+                    {
+                        ReleaseButtons(heavyButton, secondaryButton, secondaryButtonDelay);
+                        heavyPressed = false;
+                    }
+                    else
+                    {
+                        ReleaseButtons(primaryButton, secondaryButton, secondaryButtonDelay);
+                        buttonPressed = false;
+                    }
+
+                    if (currentTime - lastPressTime >= (pressDuration + cooldownDuration))
+                    {
+                        state = SequentialPressState.Idle;
+                    }
+                }
+                break;
+        }
+    }
+
+    private async void PressButtons(Button primaryButton, Button? secondaryButton, long secondaryButtonDelay)
+    {
+        _buttonsMotion[(int)primaryButton] = true;
+        UpdateInput();
+
+        if (secondaryButton.HasValue)
+        {
+            if (secondaryButtonDelay > 0)
+            {
+                await Task.Delay((int)secondaryButtonDelay);
+            }
+            _buttonsMotion[(int)secondaryButton.Value] = true;
+            UpdateInput();
+        }
+    }
+
+    private async void ReleaseButtons(Button primaryButton, Button? secondaryButton, long secondaryButtonDelay)
+    {
+        _buttonsMotion[(int)primaryButton] = false;
+        UpdateInput();
+
+        if (secondaryButton.HasValue)
+        {
+            if (secondaryButtonDelay > 0)
+            {
+                await Task.Delay((int)secondaryButtonDelay);
+            }
+            _buttonsMotion[(int)secondaryButton.Value] = false;
+            UpdateInput();
         }
     }
 
@@ -1122,16 +2593,10 @@ public class Joycon
             (int)Button.DpadRight => (int)Button.A,
             (int)Button.DpadUp => (int)Button.X,
             (int)Button.DpadLeft => (int)Button.Y,
-            (int)Button.Stick => (int)Button.Stick2,
-            (int)Button.Shoulder1 => (int)Button.Shoulder21,
-            (int)Button.Shoulder2 => (int)Button.Shoulder22,
             (int)Button.B => (int)Button.DpadDown,
             (int)Button.A => (int)Button.DpadRight,
             (int)Button.X => (int)Button.DpadUp,
             (int)Button.Y => (int)Button.DpadLeft,
-            (int)Button.Stick2 => (int)Button.Stick,
-            (int)Button.Shoulder21 => (int)Button.Shoulder1,
-            (int)Button.Shoulder22 => (int)Button.Shoulder2,
             _ => button
         };
     }
@@ -1178,6 +2643,7 @@ public class Joycon
 
     private void SimulateRemappedButtons()
     {
+        // Handle only physical button presses
         if (_buttonsDown[(int)Button.Capture])
         {
             Simulate(Settings.Value("capture"), false);
@@ -1252,7 +2718,7 @@ public class Joycon
             SimulateContinous(controller._buttons[(int)Button.SL], Settings.Value("sl_l"));
             SimulateContinous(controller._buttons[(int)Button.SR], Settings.Value("sr_l"));
         }
-        
+
         if (!IsLeft || IsJoined)
         {
             var controller = !IsLeft ? this : Other;
@@ -1270,12 +2736,32 @@ public class Joycon
         {
             lock (_buttons)
             {
+                // Copy physical button states
                 Array.Copy(_buttons, _buttonsRemapped, _buttons.Length);
+
+                // Overlay motion-induced button presses
+                for (int i = 0; i < _buttons.Length; i++)
+                {
+                    if (_buttonsMotion[i])
+                    {
+                        _buttonsRemapped[i] = true;
+                    }
+                }
 
                 ReleaseRemappedButtons();
                 SimulateRemappedButtons();
             }
         }
+    }
+
+    // 4. Optional: Method to reset motion buttons
+    public void ResetMotionButtons()
+    {
+        lock (_buttonsMotion)
+        {
+            Array.Clear(_buttonsMotion, 0, _buttonsMotion.Length);
+        }
+        UpdateInput();
     }
 
     private static bool HandleJoyAction(string settingKey, out int button)
@@ -1302,7 +2788,7 @@ public class Joycon
 
     private void DoThingsWithButtons()
     {
-        var powerOffButton = (int)(!IsJoycon || !IsLeft || IsJoined ? Button.Home : Button.Capture);
+        var powerOffButton = (int)(IsPro || !IsLeft || IsJoined ? Button.Home : Button.Capture);
         var timestampNow = Stopwatch.GetTimestamp();
 
         if (!IsUSB)
@@ -1331,34 +2817,33 @@ public class Joycon
             {
                 if (IsJoined)
                 {
-                    Other.RequestPowerOff();
+                    Program.Mgr.PowerOff(Other);
                 }
-                RequestPowerOff();
+                PowerOff();
                 return;
             }
         }
 
         if (IsJoycon && !_calibrateSticks && !_calibrateIMU)
         {
-            if (Config.ChangeOrientationDoubleClick && _buttonsDown[(int)Button.Stick] && _lastDoubleClick != -1)
+            if (Config.ChangeOrientationDoubleClick && _buttonsDown[(int)Button.LS] && _lastDoubleClick != -1)
             {
-                if (_buttonsDownTimestamp[(int)Button.Stick] - _lastDoubleClick < 3000000)
+                if (_buttonsDownTimestamp[(int)Button.LS] - _lastDoubleClick < 3000000)
                 {
                     Program.Mgr.JoinOrSplitJoycon(this);
 
-                    _lastDoubleClick = _buttonsDownTimestamp[(int)Button.Stick];
+                    _lastDoubleClick = _buttonsDownTimestamp[(int)Button.LS];
                     return;
                 }
 
-                _lastDoubleClick = _buttonsDownTimestamp[(int)Button.Stick];
+                _lastDoubleClick = _buttonsDownTimestamp[(int)Button.LS];
             }
-            else if (Config.ChangeOrientationDoubleClick && _buttonsDown[(int)Button.Stick])
+            else if (Config.ChangeOrientationDoubleClick && _buttonsDown[(int)Button.LS])
             {
-                _lastDoubleClick = _buttonsDownTimestamp[(int)Button.Stick];
+                _lastDoubleClick = _buttonsDownTimestamp[(int)Button.LS];
             }
         }
 
-        DetectShake();
         RemapButtons();
 
         if (HandleJoyAction("swap_ab", out int button) && IsButtonDown(button))
@@ -1397,12 +2882,12 @@ public class Joycon
         _AHRS.GetEulerAngles(_curRotation);
         float dt = _avgReceiveDeltaMs.GetAverage() / 1000;
 
-        if (UseGyroAnalogSliders())
+        if (Config.GyroAnalogSliders && (Other != null || IsPro))
         {
-            var leftT = IsLeft ? Button.Shoulder2 : Button.Shoulder22;
-            var rightT = IsLeft ? Button.Shoulder22 : Button.Shoulder2;
-            var left = IsLeft || !IsJoycon ? this : Other;
-            var right = !IsLeft || !IsJoycon ? this : Other;
+            var leftT = IsLeft ? Button.LT : Button.RT;
+            var rightT = IsLeft ? Button.RT : Button.LT;
+            var left = IsLeft || IsPro ? this : Other;
+            var right = !IsLeft || IsPro ? this : Other;
 
             int ldy, rdy;
             if (Config.UseFilteredIMU)
@@ -1528,7 +3013,6 @@ public class Joycon
         // the home light stays on for 2625ms, set to less than half in case of packet drop
         const int sendHomeLightIntervalMs = 1250;
         Stopwatch timeSinceHomeLight = new();
-        bool oldHomeLEDOn = false;
 
         while (IsDeviceReady)
         {
@@ -1547,13 +3031,10 @@ public class Joycon
                 continue;
             }
 
-            bool homeLEDOn = Config.HomeLEDOn;
-            if ((oldHomeLEDOn != homeLEDOn) ||
-                (homeLEDOn && timeSinceHomeLight.ElapsedMilliseconds > sendHomeLightIntervalMs))
+            if (Config.HomeLEDOn && (timeSinceHomeLight.ElapsedMilliseconds > sendHomeLightIntervalMs || !timeSinceHomeLight.IsRunning))
             {
                 SetHomeLight(Config.HomeLEDOn);
                 timeSinceHomeLight.Restart();
-                oldHomeLEDOn = homeLEDOn;
             }
 
             while (_rumbles.TryDequeue(out var rumbleData))
@@ -1572,7 +3053,6 @@ public class Joycon
 
         int dropAfterMs = IsUSB ? 1500 : 3000;
         Stopwatch timeSinceError = new();
-        Stopwatch timeSinceRequest = new();
         int reconnectAttempts = 0;
 
         // For IMU timestamp calculation
@@ -1591,66 +3071,14 @@ public class Joycon
                 continue;
             }
 
-            // Requests here since we need to read and write, otherwise not thread safe
-            bool requestPowerOff = _requestPowerOff;
-            bool requestSetLEDByPadID = _requestSetLEDByPadID;
-
-            if (requestPowerOff || requestSetLEDByPadID)
-            {
-                if (!timeSinceRequest.IsRunning || timeSinceRequest.ElapsedMilliseconds > 500)
-                {
-                    _pauseSendCommands = true;
-                    if (!_sendCommandsPaused)
-                    {
-                        Thread.Sleep(10);
-                        continue;
-                    }
-
-                    bool requestSuccess = false;
-
-                    if (requestPowerOff)
-                    {
-                        requestSuccess = PowerOff();
-                        DebugPrint($"Request PowerOff: ok={requestSuccess}", DebugType.Comms);
-
-                        if (requestSuccess)
-                        {
-                            // exit
-                            continue;
-                        }
-                    }
-                    else if (requestSetLEDByPadID)
-                    {
-                        requestSuccess = SetLEDByPadID();
-                        DebugPrint($"Request SetLEDByPadID: ok={requestSuccess}", DebugType.Comms);
-
-                        if (requestSuccess)
-                        {
-                            _requestSetLEDByPadID = false;
-                        }
-                    }
-
-                    if (requestSuccess)
-                    {
-                        timeSinceRequest.Reset();
-                    }
-                    else
-                    {
-                        timeSinceRequest.Restart();
-                    }
-                }
-            }
-
             // Attempt reconnection, we interrupt the thread send commands to improve the reliability
             // and to avoid thread safety issues with hidapi as we're doing both read/write
             if (timeSinceError.ElapsedMilliseconds > dropAfterMs)
             {
-                if (requestPowerOff || (IsUSB && reconnectAttempts >= 3))
+                if (IsUSB && reconnectAttempts >= 3)
                 {
                     Log("Dropped.", Logger.LogLevel.Warning);
-                    Drop(!requestPowerOff, false);
-
-                    // exit
+                    State = Status.Errored;
                     continue;
                 }
 
@@ -1668,7 +3096,7 @@ public class Joycon
                     {
                         USBPairing();
                         SetReportMode(ReportMode.StandardFull);
-                        RequestSetLEDByPadID();
+                        SetLEDByPadID();
                     }
                     // ignore and retry
                     catch (Exception e)
@@ -1679,7 +3107,7 @@ public class Joycon
                 else
                 {
                     //Log("Attempt soft reconnect...");
-                    SetReportMode(ReportMode.StandardFull);
+                    SetReportMode(ReportMode.StandardFull, false);
                 }
 
                 ++reconnectAttempts;
@@ -1700,7 +3128,7 @@ public class Joycon
             {
                 // should not happen
                 Log("Dropped (invalid handle).", Logger.LogLevel.Error);
-                Drop(true, false);
+                State = Status.Errored;
             }
             else
             {
@@ -1724,11 +3152,6 @@ public class Joycon
 
     private void ExtractSticksValues(ReadOnlySpan<byte> reportBuf)
     {
-        if (!SticksSupported())
-        {
-            return;
-        }
-
         byte reportType = reportBuf[0];
 
         if (reportType == (byte)ReportMode.StandardFull)
@@ -1815,6 +3238,14 @@ public class Joycon
         {
             var offset = IsLeft ? 2 : 0;
 
+            if (!IsLeft || IsPro)
+            {
+                _buttons[(int)Button.B] = (reportBuf[3] & 0x04) != 0;
+                _buttons[(int)Button.A] = (reportBuf[3] & 0x08) != 0;
+                _buttons[(int)Button.X] = (reportBuf[3] & 0x02) != 0;
+                _buttons[(int)Button.Y] = (reportBuf[3] & 0x01) != 0;
+            }
+
             _buttons[(int)Button.DpadDown] = (reportBuf[3 + offset] & (IsLeft ? 0x01 : 0x04)) != 0;
             _buttons[(int)Button.DpadRight] = (reportBuf[3 + offset] & (IsLeft ? 0x04 : 0x08)) != 0;
             _buttons[(int)Button.DpadUp] = (reportBuf[3 + offset] & 0x02) != 0;
@@ -1823,23 +3254,22 @@ public class Joycon
             _buttons[(int)Button.Capture] = (reportBuf[4] & 0x20) != 0;
             _buttons[(int)Button.Minus] = (reportBuf[4] & 0x01) != 0;
             _buttons[(int)Button.Plus] = (reportBuf[4] & 0x02) != 0;
-            _buttons[(int)Button.Stick] = (reportBuf[4] & (IsLeft ? 0x08 : 0x04)) != 0;
-            _buttons[(int)Button.Shoulder1] = (reportBuf[3 + offset] & 0x40) != 0;
-            _buttons[(int)Button.Shoulder2] = (reportBuf[3 + offset] & 0x80) != 0;
-            _buttons[(int)Button.SR] = (reportBuf[3 + offset] & 0x10) != 0;
-            _buttons[(int)Button.SL] = (reportBuf[3 + offset] & 0x20) != 0;
+            _buttons[(int)Button.LS] = (reportBuf[4] & 0x08) != 0;
+            _buttons[(int)Button.RS] = (reportBuf[4] & 0x04) != 0;
 
-            if (!IsJoycon)
+            if (IsPro)
             {
-                _buttons[(int)Button.B] = (reportBuf[3] & 0x04) != 0;
-                _buttons[(int)Button.A] = (reportBuf[3] & 0x08) != 0;
-                _buttons[(int)Button.X] = (reportBuf[3] & 0x02) != 0;
-                _buttons[(int)Button.Y] = (reportBuf[3] & 0x01) != 0;
-
-                _buttons[(int)Button.Shoulder21] = (reportBuf[3] & 0x40) != 0;
-                _buttons[(int)Button.Shoulder22] = (reportBuf[3] & 0x80) != 0;
-
-                _buttons[(int)Button.Stick2] = (reportBuf[4] & 0x04) != 0;
+                _buttons[(int)Button.LB] = (reportBuf[3] & 0x40) != 0;
+                _buttons[(int)Button.LT] = (reportBuf[3] & 0x80) != 0;
+                _buttons[(int)Button.RB] = (reportBuf[3 + 2] & 0x40) != 0;
+                _buttons[(int)Button.RT] = (reportBuf[3 + 2] & 0x80) != 0;
+            }
+            else
+            {
+                _buttons[(int)Button.LB] = (reportBuf[3 + offset] & 0x40) != 0;
+                _buttons[(int)Button.LT] = (reportBuf[3 + offset] & 0x80) != 0;
+                _buttons[(int)Button.SR] = (reportBuf[3 + offset] & 0x10) != 0;
+                _buttons[(int)Button.SL] = (reportBuf[3 + offset] & 0x20) != 0;
             }
         }
         else if (reportType == (byte)ReportMode.SimpleHID)
@@ -1848,28 +3278,27 @@ public class Joycon
             _buttons[(int)Button.Capture] = (reportBuf[2] & 0x20) != 0;
             _buttons[(int)Button.Minus] = (reportBuf[2] & 0x01) != 0;
             _buttons[(int)Button.Plus] = (reportBuf[2] & 0x02) != 0;
-            _buttons[(int)Button.Stick] = (reportBuf[2] & (IsLeft ? 0x04 : 0x08)) != 0;
-            
-            if (!IsJoycon)
+            _buttons[(int)Button.LS] = (reportBuf[2] & 0x04) != 0;
+            _buttons[(int)Button.RS] = (reportBuf[2] & 0x08) != 0;
+
+            if (IsPro)
             {
                 byte stickHat = reportBuf[3];
 
                 _buttons[(int)Button.DpadDown] = stickHat == 0x03 || stickHat == 0x04 || stickHat == 0x05;
                 _buttons[(int)Button.DpadRight] = stickHat == 0x01 || stickHat == 0x02 || stickHat == 0x03;
                 _buttons[(int)Button.DpadUp] = stickHat == 0x07 || stickHat == 0x00 || stickHat == 0x01;
-                _buttons[(int)Button.DpadLeft] =  stickHat == 0x05 ||  stickHat == 0x06 || stickHat == 0x07;
+                _buttons[(int)Button.DpadLeft] = stickHat == 0x05 || stickHat == 0x06 || stickHat == 0x07;
 
                 _buttons[(int)Button.B] = (reportBuf[1] & 0x01) != 0;
                 _buttons[(int)Button.A] = (reportBuf[1] & 0x02) != 0;
                 _buttons[(int)Button.X] = (reportBuf[1] & 0x08) != 0;
                 _buttons[(int)Button.Y] = (reportBuf[1] & 0x04) != 0;
 
-                _buttons[(int)Button.Shoulder1] = (reportBuf[1] & 0x10) != 0;
-                _buttons[(int)Button.Shoulder2] = (reportBuf[1] & 0x40) != 0;
-                _buttons[(int)Button.Shoulder21] = (reportBuf[1] & 0x20) != 0;
-                _buttons[(int)Button.Shoulder22] = (reportBuf[1] & 0x80) != 0;
-
-                _buttons[(int)Button.Stick2] = (reportBuf[2] & 0x08) != 0;
+                _buttons[(int)Button.LB] = (reportBuf[1] & 0x10) != 0;
+                _buttons[(int)Button.LT] = (reportBuf[1] & 0x40) != 0;
+                _buttons[(int)Button.RB] = (reportBuf[1] & 0x20) != 0;
+                _buttons[(int)Button.RT] = (reportBuf[1] & 0x80) != 0;
             }
             else
             {
@@ -1878,8 +3307,8 @@ public class Joycon
                 _buttons[(int)Button.DpadUp] = (reportBuf[1] & (IsLeft ? 0x04 : 0x02)) != 0;
                 _buttons[(int)Button.DpadLeft] = (reportBuf[1] & (IsLeft ? 0x01 : 0x08)) != 0;
 
-                _buttons[(int)Button.Shoulder1] = (reportBuf[2] & 0x40) != 0;
-                _buttons[(int)Button.Shoulder2] = (reportBuf[2] & 0x80) != 0;
+                _buttons[(int)Button.LB] = (reportBuf[2] & 0x40) != 0;
+                _buttons[(int)Button.LT] = (reportBuf[2] & 0x80) != 0;
 
                 _buttons[(int)Button.SR] = (reportBuf[1] & 0x20) != 0;
                 _buttons[(int)Button.SL] = (reportBuf[1] & 0x10) != 0;
@@ -1896,7 +3325,7 @@ public class Joycon
         var activity = false;
         var timestamp = Stopwatch.GetTimestamp();
 
-        if (SticksSupported())
+        if (!IsSNES)
         {
             ExtractSticksValues(reportBuf);
 
@@ -1981,41 +3410,65 @@ public class Joycon
             }
         }
 
-        // Set button states both for ViGEm
+        // Set button states
         lock (_buttons)
         {
             lock (_buttonsPrev)
             {
                 Array.Copy(_buttons, _buttonsPrev, _buttons.Length);
             }
-
             Array.Clear(_buttons);
-
             ExtractButtonsValues(reportBuf);
-
             if (IsJoined)
             {
-                _buttons[(int)Button.B] = Other._buttons[(int)Button.DpadDown];
-                _buttons[(int)Button.A] = Other._buttons[(int)Button.DpadRight];
-                _buttons[(int)Button.X] = Other._buttons[(int)Button.DpadUp];
-                _buttons[(int)Button.Y] = Other._buttons[(int)Button.DpadLeft];
-
-                _buttons[(int)Button.Stick2] = Other._buttons[(int)Button.Stick];
-                _buttons[(int)Button.Shoulder21] = Other._buttons[(int)Button.Shoulder1];
-                _buttons[(int)Button.Shoulder22] = Other._buttons[(int)Button.Shoulder2];
-
                 if (IsLeft)
                 {
+                    // Left Joy-Con in joined mode handles D-pad
+                    _buttons[(int)Button.DpadDown] = _buttons[(int)Button.DpadDown];
+                    _buttons[(int)Button.DpadUp] = _buttons[(int)Button.DpadUp];
+                    _buttons[(int)Button.DpadLeft] = _buttons[(int)Button.DpadLeft];
+                    _buttons[(int)Button.DpadRight] = _buttons[(int)Button.DpadRight];
+
+                    // Clear face buttons for left Joy-Con
+                    _buttons[(int)Button.B] = false;
+                    _buttons[(int)Button.A] = false;
+                    _buttons[(int)Button.X] = false;
+                    _buttons[(int)Button.Y] = false;
+                }
+                else
+                {
+                    // Right Joy-Con in joined mode handles face buttons
+                    _buttons[(int)Button.B] = _buttons[(int)Button.B];
+                    _buttons[(int)Button.A] = _buttons[(int)Button.A];
+                    _buttons[(int)Button.X] = _buttons[(int)Button.X];
+                    _buttons[(int)Button.Y] = _buttons[(int)Button.Y];
+
+                    // Clear D-pad for right Joy-Con
+                    _buttons[(int)Button.DpadDown] = false;
+                    _buttons[(int)Button.DpadUp] = false;
+                    _buttons[(int)Button.DpadLeft] = false;
+                    _buttons[(int)Button.DpadRight] = false;
+                }
+                _buttons[(int)Button.RT] = _buttons[(int)Button.LT];
+                _buttons[(int)Button.RB] = _buttons[(int)Button.LB];
+
+
+                // Handle shoulder buttons and triggers
+                if (IsLeft)
+                {
+                    _buttons[(int)Button.RB] = Other._buttons[(int)Button.RB];
+                    _buttons[(int)Button.RT] = Other._buttons[(int)Button.RT];
                     _buttons[(int)Button.Home] = Other._buttons[(int)Button.Home];
                     _buttons[(int)Button.Plus] = Other._buttons[(int)Button.Plus];
                 }
                 else
                 {
+                    _buttons[(int)Button.LB] = Other._buttons[(int)Button.LB];
+                    _buttons[(int)Button.LT] = Other._buttons[(int)Button.LT];
                     _buttons[(int)Button.Capture] = Other._buttons[(int)Button.Capture];
                     _buttons[(int)Button.Minus] = Other._buttons[(int)Button.Minus];
                 }
             }
-
             lock (_buttonsUp)
             {
                 lock (_buttonsDown)
@@ -2028,7 +3481,6 @@ public class Joycon
                         {
                             _buttonsDownTimestamp[i] = _buttons[i] ? timestamp : -1;
                         }
-
                         if (_buttonsUp[i] || _buttonsDown[i])
                         {
                             activity = true;
@@ -2037,7 +3489,6 @@ public class Joycon
                 }
             }
         }
-
         if (activity)
         {
             _timestampActivity = timestamp;
@@ -2047,7 +3498,7 @@ public class Joycon
     // Get Gyro/Accel data
     private bool ExtractIMUValues(ReadOnlySpan<byte> reportBuf, int n = 0)
     {
-        if (!IMUSupported() || reportBuf[0] != (byte)ReportMode.StandardFull)
+        if (IsSNES || reportBuf[0] != (byte)ReportMode.StandardFull)
         {
             return false;
         }
@@ -2094,7 +3545,7 @@ public class Joycon
             _accG.X = (_accRaw[0] - _activeIMUData[3]) * (1.0f / (_accSensiti[0] - _accNeutral[0])) * 4.0f;
             _gyrG.X = (_gyrRaw[0] - _activeIMUData[0]) * (816.0f / (_gyrSensiti[0] - _activeIMUData[0]));
 
-            _accG.Y = direction * (_accRaw[1] -_activeIMUData[4]) * (1.0f / (_accSensiti[1] - _accNeutral[1])) * 4.0f;
+            _accG.Y = direction * (_accRaw[1] - _activeIMUData[4]) * (1.0f / (_accSensiti[1] - _accNeutral[1])) * 4.0f;
             _gyrG.Y = -direction * (_gyrRaw[1] - _activeIMUData[1]) * (816.0f / (_gyrSensiti[1] - _activeIMUData[1]));
 
             _accG.Z = direction * (_accRaw[2] - _activeIMUData[5]) * (1.0f / (_accSensiti[2] - _accNeutral[2])) * 4.0f;
@@ -2163,7 +3614,7 @@ public class Joycon
         }
 
         _receiveReportsThread = new Thread(
-            () => 
+            () =>
             {
                 try
                 {
@@ -2228,7 +3679,7 @@ public class Joycon
         float magnitude = MathF.Sqrt(normalizedX * normalizedX + normalizedY * normalizedY);
 
         if (magnitude <= deadzone || range <= deadzone)
-        {  
+        {
             // Inner deadzone
             stick[0] = 0.0f;
             stick[1] = 0.0f;
@@ -2237,19 +3688,19 @@ public class Joycon
         {
             float normalizedMagnitude = Math.Min(1.0f, (magnitude - deadzone) / (range - deadzone));
             float scale = normalizedMagnitude / magnitude;
-            
+
             normalizedX *= scale;
             normalizedY *= scale;
 
             if (!Config.SticksSquared || normalizedX == 0f || normalizedY == 0f)
             {
-				stick[0] = normalizedX;
-				stick[1] = normalizedY;
-			}
+                stick[0] = normalizedX;
+                stick[1] = normalizedY;
+            }
             else
             {
                 // Expand the circle to a square area
-				if (Math.Abs(normalizedX) > Math.Abs(normalizedY))
+                if (Math.Abs(normalizedX) > Math.Abs(normalizedY))
                 {
                     stick[0] = Math.Sign(normalizedX) * normalizedMagnitude;
                     stick[1] = stick[0] * normalizedY / normalizedX;
@@ -2259,7 +3710,7 @@ public class Joycon
                     stick[1] = Math.Sign(normalizedY) * normalizedMagnitude;
                     stick[0] = stick[1] * normalizedX / normalizedY;
                 }
-			}
+            }
 
             stick[0] = Math.Clamp(stick[0], -1.0f, 1.0f);
             stick[1] = Math.Clamp(stick[1], -1.0f, 1.0f);
@@ -2300,11 +3751,11 @@ public class Joycon
         Write(buf);
     }
 
-    private int Subcommand(byte sc, ReadOnlySpan<byte> bufParameters, bool print = true)
+    private bool Subcommand(byte sc, ReadOnlySpan<byte> bufParameters, bool print = true)
     {
         if (_handle == IntPtr.Zero)
         {
-            return DeviceErroredCode;
+            return false;
         }
 
         Span<byte> buf = stackalloc byte[_CommandLength];
@@ -2324,7 +3775,7 @@ public class Joycon
 
         int length = Write(buf);
 
-        return length;
+        return length > 0;
     }
 
     private int SubcommandCheck(byte sc, ReadOnlySpan<byte> bufParameters, bool print = true)
@@ -2336,20 +3787,21 @@ public class Joycon
 
     private int SubcommandCheck(byte sc, ReadOnlySpan<byte> bufParameters, Span<byte> response, bool print = true)
     {
-        int length = Subcommand(sc, bufParameters, print);
-        if (length <= 0)
+        bool sent = Subcommand(sc, bufParameters, print);
+        if (!sent)
         {
             DebugPrint($"Subcommand write error: {ErrorMessage()}", DebugType.Comms);
-            return length;
+            return 0;
         }
 
         int tries = 0;
+        int length;
         bool responseFound;
         do
         {
             length = Read(response, 100); // don't set the timeout lower than 100 or might not always work
             responseFound = length >= 20 && response[0] == 0x21 && response[14] == sc;
-            
+
             if (length < 0)
             {
                 DebugPrint($"Subcommand read error: {ErrorMessage()}", DebugType.Comms);
@@ -2361,7 +3813,7 @@ public class Joycon
         if (!responseFound)
         {
             DebugPrint("No response.", DebugType.Comms);
-            return length;
+            return 0;
         }
 
         if (print)
@@ -2391,21 +3843,6 @@ public class Joycon
     private bool CalibrationDataSupported()
     {
         return !IsSNES && !IsThirdParty;
-    }
-
-    private bool SticksSupported()
-    {
-        return !IsSNES;
-    }
-
-    public bool IMUSupported()
-    {
-        return !IsSNES && !IsN64;
-    }
-
-    private bool UseGyroAnalogSliders()
-    {
-        return Config.GyroAnalogSliders && IMUSupported() && (!IsJoycon || Other != null);
     }
 
     private bool DumpCalibrationData()
@@ -2523,7 +3960,6 @@ public class Joycon
         }
 
         // Gyro and accelerometer
-        if (IMUSupported())
         {
             var userSensorData = ReadSPICheck(0x80, 0x26, 0x1A, ref ok);
             ReadOnlySpan<byte> sensorData = new ReadOnlySpan<byte>(userSensorData, 2, 24);
@@ -2563,7 +3999,7 @@ public class Joycon
 
             if (_accNeutral[0] == -1 || _accNeutral[1] == -1 || _accNeutral[2] == -1)
             {
-                Array.Fill(_accNeutral, (short) 0);
+                Array.Fill(_accNeutral, (short)0);
                 noCalibration = true;
             }
 
@@ -2617,15 +4053,12 @@ public class Joycon
             _IMUCalibrated = false;
             _SticksCalibrated = false;
         }
-        
+
         var calibrationType = _SticksCalibrated ? "user" : _DumpedCalibration ? "controller" : "default";
         Log($"Using {calibrationType} sticks calibration.");
 
-        if (IMUSupported())
-        {
-            calibrationType = _IMUCalibrated ? "user" : _DumpedCalibration ? "controller" : "default";
-            Log($"Using {calibrationType} sensors calibration.");
-        }
+        calibrationType = _IMUCalibrated ? "user" : _DumpedCalibration ? "controller" : "default";
+        Log($"Using {calibrationType} sensors calibration.");
     }
 
     private int Read(Span<byte> response, int timeout = 100)
@@ -2669,12 +4102,6 @@ public class Joycon
         {
             return $"Device unavailable : {State}";
         }
-
-        if (_handle ==  IntPtr.Zero)
-        {
-            return "Null handle";
-        }
-
         return HIDApi.Error(_handle);
     }
 
@@ -2762,7 +4189,7 @@ public class Joycon
         }
 
         byte[] bufSubcommand = { addr2, addr1, 0x00, 0x00, (byte)len };
-        
+
         Span<byte> response = stackalloc byte[ReportLength];
 
         ok = false;
@@ -2853,19 +4280,19 @@ public class Joycon
             if (right) return DpadDirection.Northeast;
             return DpadDirection.North;
         }
-        
+
         if (down)
         {
             if (left) return DpadDirection.Southwest;
             if (right) return DpadDirection.Southeast;
             return DpadDirection.South;
         }
-        
+
         if (left)
         {
             return DpadDirection.West;
         }
-        
+
         if (right)
         {
             return DpadDirection.East;
@@ -2879,10 +4306,8 @@ public class Joycon
         var output = new OutputControllerXbox360InputState();
 
         var isPro = input.IsPro;
-        var isSNES = input.IsSNES;
-        var isN64 = input.IsN64;
-        var isJoycon = input.IsJoycon;
         var isLeft = input.IsLeft;
+        var isSNES = input.IsSNES;
         var other = input.Other;
 
         var buttons = input._buttonsRemapped;
@@ -2890,82 +4315,24 @@ public class Joycon
         var stick2 = input._stick2;
         var sliderVal = input._sliderVal;
 
-        var gyroAnalogSliders = input.UseGyroAnalogSliders();
+        var gyroAnalogSliders = input.Config.GyroAnalogSliders;
         var swapAB = input.Config.SwapAB;
         var swapXY = input.Config.SwapXY;
 
         if (other != null && !isLeft)
         {
-            gyroAnalogSliders = other.UseGyroAnalogSliders();
+            gyroAnalogSliders = other.Config.GyroAnalogSliders;
             swapAB = other.Config.SwapAB;
             swapXY = other.Config.SwapXY;
         }
 
-        if (isJoycon)
+        if (isPro)
         {
-            if (other != null) // no need for && other != this
-            {
-                output.A = buttons[(int)(isLeft ? Button.B : Button.DpadDown)];
-                output.B = buttons[(int)(isLeft ? Button.A : Button.DpadRight)];
-                output.X = buttons[(int)(isLeft ? Button.Y : Button.DpadLeft)];
-                output.Y = buttons[(int)(isLeft ? Button.X : Button.DpadUp)];
-
-                output.DpadUp = buttons[(int)(isLeft ? Button.DpadUp : Button.X)];
-                output.DpadDown = buttons[(int)(isLeft ? Button.DpadDown : Button.B)];
-                output.DpadLeft = buttons[(int)(isLeft ? Button.DpadLeft : Button.Y)];
-                output.DpadRight = buttons[(int)(isLeft ? Button.DpadRight : Button.A)];
-
-                output.Back = buttons[(int)Button.Minus];
-                output.Start = buttons[(int)Button.Plus];
-                output.Guide = buttons[(int)Button.Home];
-
-                output.ShoulderLeft = buttons[(int)(isLeft ? Button.Shoulder1 : Button.Shoulder21)];
-                output.ShoulderRight = buttons[(int)(isLeft ? Button.Shoulder21 : Button.Shoulder1)];
-
-                output.ThumbStickLeft = buttons[(int)(isLeft ? Button.Stick : Button.Stick2)];
-                output.ThumbStickRight = buttons[(int)(isLeft ? Button.Stick2 : Button.Stick)];
-            }
-            else
-            {
-                // single joycon in horizontal
-                output.A = buttons[(int)(isLeft ? Button.DpadLeft : Button.DpadRight)];
-                output.B = buttons[(int)(isLeft ? Button.DpadDown : Button.DpadUp)];
-                output.X = buttons[(int)(isLeft ? Button.DpadUp : Button.DpadDown)];
-                output.Y = buttons[(int)(isLeft ? Button.DpadRight : Button.DpadLeft)];
-
-                output.Back = buttons[(int)Button.Minus] | buttons[(int)Button.Home];
-                output.Start = buttons[(int)Button.Plus] | buttons[(int)Button.Capture];
-
-                output.ShoulderLeft = buttons[(int)Button.SL];
-                output.ShoulderRight = buttons[(int)Button.SR];
-
-                output.ThumbStickLeft = buttons[(int)Button.Stick];
-            }
-        }
-        else if (isN64)
-        {
-            // Mapping at https://github.com/dekuNukem/Nintendo_Switch_Reverse_Engineering/pull/133/files
-
-            output.A = buttons[(int)Button.B];
-            output.B = buttons[(int)Button.A];
-
-            output.DpadUp = buttons[(int)Button.DpadUp];
-            output.DpadDown = buttons[(int)Button.DpadDown];
-            output.DpadLeft = buttons[(int)Button.DpadLeft];
-            output.DpadRight = buttons[(int)Button.DpadRight];
-
-            output.Start = buttons[(int)Button.Plus];
-            output.Guide = buttons[(int)Button.Home];
-
-            output.ShoulderLeft = buttons[(int)Button.Shoulder1];
-            output.ShoulderRight = buttons[(int)Button.Shoulder21];
-        }
-        else
-        {
-            output.A = buttons[(int)Button.B];
-            output.B = buttons[(int)Button.A];
-            output.Y = buttons[(int)Button.X];
-            output.X = buttons[(int)Button.Y];
+            // Pro controller mapping
+            output.A = buttons[(int)(!swapAB ? Button.B : Button.A)];
+            output.B = buttons[(int)(!swapAB ? Button.A : Button.B)];
+            output.X = buttons[(int)(!swapXY ? Button.Y : Button.X)];
+            output.Y = buttons[(int)(!swapXY ? Button.X : Button.Y)];
 
             output.DpadUp = buttons[(int)Button.DpadUp];
             output.DpadDown = buttons[(int)Button.DpadDown];
@@ -2976,78 +4343,146 @@ public class Joycon
             output.Start = buttons[(int)Button.Plus];
             output.Guide = buttons[(int)Button.Home];
 
-            output.ShoulderLeft = buttons[(int)Button.Shoulder1];
-            output.ShoulderRight = buttons[(int)Button.Shoulder21];
+            output.ShoulderLeft = buttons[(int)Button.LB];
+            output.ShoulderRight = buttons[(int)Button.RB];
 
-            output.ThumbStickLeft = buttons[(int)Button.Stick];
-            output.ThumbStickRight = buttons[(int)Button.Stick2];
+            output.ThumbStickLeft = buttons[(int)Button.LS];
+            output.ThumbStickRight = buttons[(int)Button.RS];
         }
-
-        if (input.SticksSupported())
+        else if (other != null) // Joined Joy-Cons
         {
-            if (isJoycon && other == null)
+            if (isLeft)
             {
-                output.AxisLeftY = CastStickValue((isLeft ? 1 : -1) * stick[0]);
-                output.AxisLeftX = CastStickValue((isLeft ? -1 : 1) * stick[1]);
-            }
-            else if (isN64)
-            {
-                output.AxisLeftX = CastStickValue(stick[0]);
-                output.AxisLeftY = CastStickValue(stick[1]);
+                // Left Joy-Con handles D-pad
+                output.DpadUp = buttons[(int)Button.DpadUp];
+                output.DpadDown = buttons[(int)Button.DpadDown];
+                output.DpadLeft = buttons[(int)Button.DpadLeft];
+                output.DpadRight = buttons[(int)Button.DpadRight];
 
-                // C buttons mapped to right stick
-                output.AxisRightX = CastStickValue((buttons[(int)Button.X] ? -1 : 0) + (buttons[(int)Button.Minus] ? 1 : 0));
-                output.AxisRightY = CastStickValue((buttons[(int)Button.Shoulder22] ? -1 : 0) + (buttons[(int)Button.Y] ? 1 : 0));
+
+                // Face buttons come from the right Joy-Con
+                output.A = other._buttonsRemapped[(int)(!swapAB ? Button.B : Button.A)];
+                output.B = other._buttonsRemapped[(int)(!swapAB ? Button.A : Button.B)];
+                output.X = other._buttonsRemapped[(int)(!swapXY ? Button.Y : Button.X)];
+                output.Y = other._buttonsRemapped[(int)(!swapXY ? Button.X : Button.Y)];
+
+                output.ShoulderLeft = buttons[(int)Button.LB];
+                output.ShoulderRight = other._buttonsRemapped[(int)Button.RB];
+
+                output.Back = buttons[(int)Button.Minus];
+                output.Start = other._buttonsRemapped[(int)Button.Plus];
+                output.Guide = buttons[(int)Button.Home];
+
+                output.ThumbStickLeft = buttons[(int)Button.LS];
+                output.ThumbStickRight = other._buttonsRemapped[(int)Button.RS];
             }
             else
             {
+                // Right Joy-Con handles face buttons
+                output.A = buttons[(int)(!swapAB ? Button.B : Button.A)];
+                output.B = buttons[(int)(!swapAB ? Button.A : Button.B)];
+                output.X = buttons[(int)(!swapXY ? Button.Y : Button.X)];
+                output.Y = buttons[(int)(!swapXY ? Button.X : Button.Y)];
+
+                // D-pad comes from the left Joy-Con
+                output.DpadUp = other._buttonsRemapped[(int)Button.DpadUp];
+                output.DpadDown = other._buttonsRemapped[(int)Button.DpadDown];
+                output.DpadLeft = other._buttonsRemapped[(int)Button.DpadLeft];
+                output.DpadRight = other._buttonsRemapped[(int)Button.DpadRight];
+
+                output.ThumbStickLeft = buttons[(int)Button.LS];
+
+                output.ShoulderLeft = other._buttonsRemapped[(int)Button.LB];
+                output.ShoulderRight = buttons[(int)Button.RB];
+
+                output.Back = other._buttonsRemapped[(int)Button.Minus];
+                output.Start = buttons[(int)Button.Plus];
+                output.Guide = other._buttonsRemapped[(int)Button.Home];
+
+                output.ThumbStickLeft = other._buttonsRemapped[(int)Button.LS];
+                output.ThumbStickRight = buttons[(int)Button.RS];
+            }
+        }
+        else // Single Joy-Con mode
+        {
+            if (isLeft)
+            {
+                // Left Joy-Con in single mode
+                output.DpadUp = buttons[(int)Button.DpadUp];
+                output.DpadDown = buttons[(int)Button.DpadDown];
+                output.DpadLeft = buttons[(int)Button.DpadLeft];
+                output.DpadRight = buttons[(int)Button.DpadRight];
+
+                // Map SL and SR to A and B
+                output.A = buttons[(int)Button.SR];
+                output.B = buttons[(int)Button.SL];
+
+                output.ShoulderLeft = buttons[(int)Button.LB];
+                output.ShoulderRight = buttons[(int)Button.RB];
+            }
+            else
+            {
+                // Right Joy-Con in single mode
+                output.A = buttons[(int)(!swapAB ? Button.B : Button.A)];
+                output.B = buttons[(int)(!swapAB ? Button.A : Button.B)];
+                output.X = buttons[(int)(!swapXY ? Button.Y : Button.X)];
+                output.Y = buttons[(int)(!swapXY ? Button.X : Button.Y)];
+
+                // Map SL and SR to D-pad Left and Right
+                output.DpadLeft = buttons[(int)Button.SL];
+                output.DpadRight = buttons[(int)Button.SR];
+
+                output.ShoulderLeft = buttons[(int)Button.LB];
+                output.ShoulderRight = buttons[(int)Button.RB];
+            }
+
+            output.Back = buttons[(int)Button.Minus];
+            output.Start = buttons[(int)Button.Plus];
+            output.Guide = buttons[(int)Button.Home];
+
+            output.ThumbStickLeft = buttons[(int)Button.LS];
+            output.ThumbStickRight = buttons[(int)Button.RS];
+        }
+
+        // Handle analog sticks
+        if (!isSNES)
+        {
+            if (other != null || isPro)
+            {
                 output.AxisLeftX = CastStickValue(other == input && !isLeft ? stick2[0] : stick[0]);
                 output.AxisLeftY = CastStickValue(other == input && !isLeft ? stick2[1] : stick[1]);
-
                 output.AxisRightX = CastStickValue(other == input && !isLeft ? stick[0] : stick2[0]);
                 output.AxisRightY = CastStickValue(other == input && !isLeft ? stick[1] : stick2[1]);
             }
+            else
+            {
+                // Single Joy-Con mode
+                output.AxisLeftY = CastStickValue((isLeft ? 1 : -1) * stick[0]);
+                output.AxisLeftX = CastStickValue((isLeft ? -1 : 1) * stick[1]);
+            }
         }
 
-        if (isJoycon && other == null)
-        {
-            output.TriggerLeft = (byte)(buttons[(int)(isLeft ? Button.Shoulder2 : Button.Shoulder1)] ? byte.MaxValue : 0);
-            output.TriggerRight = (byte)(buttons[(int)(isLeft ? Button.Shoulder1 : Button.Shoulder2)] ? byte.MaxValue : 0);
-        }
-        else if (isN64)
-        {
-            output.TriggerLeft = (byte)(buttons[(int)Button.Shoulder2] ? byte.MaxValue : 0);
-            output.TriggerRight = (byte)(buttons[(int)Button.Stick] ? byte.MaxValue : 0);
-        }
-        else
+        // Handle triggers
+        if (isPro || other != null)
         {
             var lval = gyroAnalogSliders ? sliderVal[0] : byte.MaxValue;
             var rval = gyroAnalogSliders ? sliderVal[1] : byte.MaxValue;
-            output.TriggerLeft = (byte)(buttons[(int)(isLeft ? Button.Shoulder2 : Button.Shoulder22)] ? lval : 0);
-            output.TriggerRight = (byte)(buttons[(int)(isLeft ? Button.Shoulder22 : Button.Shoulder2)] ? rval : 0);
+            output.TriggerLeft = (byte)(buttons[(int)Button.LT] ? lval : 0);
+            output.TriggerRight = (byte)(buttons[(int)Button.RT] ? rval : 0);
         }
-
-        // Avoid conflicting output
-        if (output.DpadUp && output.DpadDown)
+        else
         {
-            output.DpadUp = false;
-            output.DpadDown = false;
-        }
-
-        if (output.DpadLeft && output.DpadRight)
-        {
-            output.DpadLeft = false;
-            output.DpadRight = false;
-        }
-
-        if (swapAB)
-        {
-            (output.A, output.B) = (output.B, output.A);
-        }
-
-        if (swapXY)
-        {
-            (output.X, output.Y) = (output.Y, output.X);
+            // Single Joy-Con mode
+            if (isLeft)
+            {
+                output.TriggerLeft = (byte)(buttons[(int)Button.LT] ? byte.MaxValue : 0);
+                output.TriggerRight = (byte)(buttons[(int)Button.LB] ? byte.MaxValue : 0);
+            }
+            else
+            {
+                output.TriggerLeft = (byte)(buttons[(int)Button.LB] ? byte.MaxValue : 0);
+                output.TriggerRight = (byte)(buttons[(int)Button.LT] ? byte.MaxValue : 0);
+            }
         }
 
         return output;
@@ -3058,10 +4493,8 @@ public class Joycon
         var output = new OutputControllerDualShock4InputState();
 
         var isPro = input.IsPro;
-        var isSNES = input.IsSNES;
-        var isN64 = input.IsN64;
-        var isJoycon = input.IsJoycon;
         var isLeft = input.IsLeft;
+        var isSNES = input.IsSNES;
         var other = input.Other;
 
         var buttons = input._buttonsRemapped;
@@ -3069,86 +4502,23 @@ public class Joycon
         var stick2 = input._stick2;
         var sliderVal = input._sliderVal;
 
-        var gyroAnalogSliders = input.UseGyroAnalogSliders();
+        var gyroAnalogSliders = input.Config.GyroAnalogSliders;
         var swapAB = input.Config.SwapAB;
         var swapXY = input.Config.SwapXY;
 
         if (other != null && !isLeft)
         {
-            gyroAnalogSliders = other.UseGyroAnalogSliders();
+            gyroAnalogSliders = other.Config.GyroAnalogSliders;
             swapAB = other.Config.SwapAB;
             swapXY = other.Config.SwapXY;
         }
 
-        if (isJoycon)
+        if (isPro)
         {
-            if (other != null) // no need for && other != this
-            {
-                output.Cross = buttons[(int)(isLeft ? Button.B : Button.DpadDown)];
-                output.Circle = buttons[(int)(isLeft ? Button.A : Button.DpadRight)];
-                output.Square = buttons[(int)(isLeft ? Button.Y : Button.DpadLeft)];
-                output.Triangle = buttons[(int)(isLeft ? Button.X : Button.DpadUp)];
-
-                output.DPad = GetDirection(
-                    buttons[(int)(isLeft ? Button.DpadUp : Button.X)],
-                    buttons[(int)(isLeft ? Button.DpadDown : Button.B)],
-                    buttons[(int)(isLeft ? Button.DpadLeft : Button.Y)],
-                    buttons[(int)(isLeft ? Button.DpadRight : Button.A)]
-                );
-
-                output.Share = buttons[(int)Button.Capture];
-                output.Options = buttons[(int)Button.Plus];
-                output.Ps = buttons[(int)Button.Home];
-                output.Touchpad = buttons[(int)Button.Minus];
-
-                output.ShoulderLeft = buttons[(int)(isLeft ? Button.Shoulder1 : Button.Shoulder21)];
-                output.ShoulderRight = buttons[(int)(isLeft ? Button.Shoulder21 : Button.Shoulder1)];
-
-                output.ThumbLeft = buttons[(int)(isLeft ? Button.Stick : Button.Stick2)];
-                output.ThumbRight = buttons[(int)(isLeft ? Button.Stick2 : Button.Stick)];
-            }
-            else
-            {
-                // single joycon in horizontal
-                output.Cross = buttons[(int)(isLeft ? Button.DpadLeft : Button.DpadRight)];
-                output.Circle = buttons[(int)(isLeft ? Button.DpadDown : Button.DpadUp)];
-                output.Square = buttons[(int)(isLeft ? Button.DpadUp : Button.DpadDown)];
-                output.Triangle = buttons[(int)(isLeft ? Button.DpadRight : Button.DpadLeft)]; 
-
-                output.Ps = buttons[(int)Button.Minus] | buttons[(int)Button.Home];
-                output.Options = buttons[(int)Button.Plus] | buttons[(int)Button.Capture];
-
-                output.ShoulderLeft = buttons[(int)Button.SL];
-                output.ShoulderRight = buttons[(int)Button.SR];
-
-                output.ThumbLeft = buttons[(int)Button.Stick];
-            }
-        }
-        else if (isN64)
-        {
-            output.Cross = buttons[(int)Button.B];
-            output.Circle = buttons[(int)Button.A];
-
-            output.DPad = GetDirection(
-                buttons[(int)Button.DpadUp],
-                buttons[(int)Button.DpadDown],
-                buttons[(int)Button.DpadLeft],
-                buttons[(int)Button.DpadRight]
-            );
-
-            output.Share = buttons[(int)Button.Capture];
-            output.Options = buttons[(int)Button.Plus];
-            output.Ps = buttons[(int)Button.Home];
-
-            output.ShoulderLeft = buttons[(int)Button.Shoulder1];
-            output.ShoulderRight = buttons[(int)Button.Shoulder21];
-        }
-        else
-        {
-            output.Cross = buttons[(int)Button.B];
-            output.Circle = buttons[(int)Button.A];
-            output.Square = buttons[(int)Button.Y];
-            output.Triangle = buttons[(int)Button.X];
+            output.Cross = buttons[(int)(!swapAB ? Button.B : Button.A)];
+            output.Circle = buttons[(int)(!swapAB ? Button.A : Button.B)];
+            output.Triangle = buttons[(int)(!swapXY ? Button.X : Button.Y)];
+            output.Square = buttons[(int)(!swapXY ? Button.Y : Button.X)];
 
             output.DPad = GetDirection(
                 buttons[(int)Button.DpadUp],
@@ -3161,77 +4531,108 @@ public class Joycon
             output.Options = buttons[(int)Button.Plus];
             output.Ps = buttons[(int)Button.Home];
             output.Touchpad = buttons[(int)Button.Minus];
-
-            output.ShoulderLeft = buttons[(int)Button.Shoulder1];
-            output.ShoulderRight = buttons[(int)Button.Shoulder21];
-
-            output.ThumbLeft = buttons[(int)Button.Stick];
-            output.ThumbRight = buttons[(int)Button.Stick2];
+            output.ShoulderLeft = buttons[(int)Button.LB];
+            output.ShoulderRight = buttons[(int)Button.RB];
+            output.ThumbLeft = buttons[(int)Button.LS];
+            output.ThumbRight = buttons[(int)Button.RS];
         }
-
-        if (input.SticksSupported())
+        else
         {
-            if (isJoycon && other == null)
+            if (other != null)
             {
-                output.ThumbLeftY = CastStickValueByte((isLeft ? 1 : -1) * -stick[0]);
-                output.ThumbLeftX = CastStickValueByte((isLeft ? 1 : -1) * -stick[1]);
+                // no need for && other != this
+                output.Cross = !swapAB
+                        ? buttons[(int)(isLeft ? Button.B : Button.DpadDown)]
+                        : buttons[(int)(isLeft ? Button.A : Button.DpadRight)];
+                output.Circle = swapAB
+                        ? buttons[(int)(isLeft ? Button.B : Button.DpadDown)]
+                        : buttons[(int)(isLeft ? Button.A : Button.DpadRight)];
+                output.Triangle = !swapXY
+                        ? buttons[(int)(isLeft ? Button.X : Button.DpadUp)]
+                        : buttons[(int)(isLeft ? Button.Y : Button.DpadLeft)];
+                output.Square = swapXY
+                        ? buttons[(int)(isLeft ? Button.X : Button.DpadUp)]
+                        : buttons[(int)(isLeft ? Button.Y : Button.DpadLeft)];
 
-                output.ThumbRightX = CastStickValueByte(0);
-                output.ThumbRightY = CastStickValueByte(0);
-            }
-            else if (isN64)
-            {
-                output.ThumbLeftX = CastStickValueByte(stick[0]);
-                output.ThumbLeftY = CastStickValueByte(-stick[1]);
+                output.DPad = GetDirection(
+                    buttons[(int)(isLeft ? Button.DpadUp : Button.X)],
+                    buttons[(int)(isLeft ? Button.DpadDown : Button.B)],
+                    buttons[(int)(isLeft ? Button.DpadLeft : Button.Y)],
+                    buttons[(int)(isLeft ? Button.DpadRight : Button.A)]
+                );
 
-                // C buttons mapped to right stick
-                output.ThumbRightX = CastStickValueByte((buttons[(int)Button.X] ? -1 : 0) + (buttons[(int)Button.Minus] ? 1 : 0));
-                output.ThumbRightY = CastStickValueByte((buttons[(int)Button.Shoulder22] ? 1 : 0) + (buttons[(int)Button.Y] ? -1 : 0));
+                output.Share = buttons[(int)Button.Capture];
+                output.Options = buttons[(int)Button.Plus];
+                output.Ps = buttons[(int)Button.Home];
+                output.Touchpad = buttons[(int)Button.Minus];
+                output.ShoulderLeft = buttons[(int)(isLeft ? Button.LB : Button.RB)];
+                output.ShoulderRight = buttons[(int)(isLeft ? Button.RB : Button.LB)];
+                output.ThumbLeft = buttons[(int)(isLeft ? Button.LS : Button.RS)];
+                output.ThumbRight = buttons[(int)(isLeft ? Button.RS : Button.LS)];
             }
             else
             {
+                // single joycon mode
+                output.Cross = !swapAB
+                        ? buttons[(int)(isLeft ? Button.DpadLeft : Button.DpadRight)]
+                        : buttons[(int)(isLeft ? Button.DpadDown : Button.DpadUp)];
+                output.Circle = swapAB
+                        ? buttons[(int)(isLeft ? Button.DpadLeft : Button.DpadRight)]
+                        : buttons[(int)(isLeft ? Button.DpadDown : Button.DpadUp)];
+                output.Triangle = !swapXY
+                        ? buttons[(int)(isLeft ? Button.DpadRight : Button.DpadLeft)]
+                        : buttons[(int)(isLeft ? Button.DpadUp : Button.DpadDown)];
+                output.Square = swapXY
+                        ? buttons[(int)(isLeft ? Button.DpadRight : Button.DpadLeft)]
+                        : buttons[(int)(isLeft ? Button.DpadUp : Button.DpadDown)];
+
+                output.Ps = buttons[(int)Button.Minus] | buttons[(int)Button.Home];
+                output.Options = buttons[(int)Button.Plus] | buttons[(int)Button.Capture];
+
+                output.ShoulderLeft = buttons[(int)Button.SL];
+                output.ShoulderRight = buttons[(int)Button.SR];
+
+                output.ThumbLeft = buttons[(int)Button.LS];
+            }
+        }
+
+        if (!isSNES)
+        {
+            if (other != null || isPro)
+            {
+                // no need for && other != this
                 output.ThumbLeftX = CastStickValueByte(other == input && !isLeft ? stick2[0] : stick[0]);
                 output.ThumbLeftY = CastStickValueByte(other == input && !isLeft ? -stick2[1] : -stick[1]);
-
                 output.ThumbRightX = CastStickValueByte(other == input && !isLeft ? stick[0] : stick2[0]);
                 output.ThumbRightY = CastStickValueByte(other == input && !isLeft ? -stick[1] : -stick2[1]);
 
                 //input.DebugPrint($"X:{-stick[0]:0.00} Y:{stick[1]:0.00}", DebugType.Threading);
                 //input.DebugPrint($"X:{output.ThumbLeftX} Y:{output.ThumbLeftY}", DebugType.Threading);
             }
+            else
+            {
+                // single joycon mode
+                output.ThumbLeftY = CastStickValueByte((isLeft ? 1 : -1) * -stick[0]);
+                output.ThumbLeftX = CastStickValueByte((isLeft ? 1 : -1) * -stick[1]);
+            }
         }
 
-        if (isJoycon && other == null)
-        {
-            output.TriggerLeftValue = (byte)(buttons[(int)(isLeft ? Button.Shoulder2 : Button.Shoulder1)] ? byte.MaxValue : 0);
-            output.TriggerRightValue = (byte)(buttons[(int)(isLeft ? Button.Shoulder1 : Button.Shoulder2)] ? byte.MaxValue : 0);
-        }
-        else if (isN64)
-        {
-            output.TriggerLeftValue = (byte)(buttons[(int)Button.Shoulder2] ? byte.MaxValue : 0);
-            output.TriggerRightValue = (byte)(buttons[(int)Button.Stick] ? byte.MaxValue : 0);
-        }
-        else
+        if (isPro || other != null)
         {
             var lval = gyroAnalogSliders ? sliderVal[0] : byte.MaxValue;
             var rval = gyroAnalogSliders ? sliderVal[1] : byte.MaxValue;
-            output.TriggerLeftValue = (byte)(buttons[(int)(isLeft ? Button.Shoulder2 : Button.Shoulder22)] ? lval : 0);
-            output.TriggerRightValue = (byte)(buttons[(int)(isLeft ? Button.Shoulder22 : Button.Shoulder2)] ? rval : 0);
+            output.TriggerLeftValue = (byte)(buttons[(int)(isLeft ? Button.LT : Button.RT)] ? lval : 0);
+            output.TriggerRightValue = (byte)(buttons[(int)(isLeft ? Button.RT : Button.LT)] ? rval : 0);
+        }
+        else
+        {
+            output.TriggerLeftValue = (byte)(buttons[(int)(isLeft ? Button.LT : Button.LB)] ? byte.MaxValue : 0);
+            output.TriggerRightValue = (byte)(buttons[(int)(isLeft ? Button.LB : Button.LT)] ? byte.MaxValue : 0);
         }
 
         // Output digital L2 / R2 in addition to analog L2 / R2
         output.TriggerLeft = output.TriggerLeftValue > 0;
         output.TriggerRight = output.TriggerRightValue > 0;
-
-        if (swapAB)
-        {
-            (output.Cross, output.Circle) = (output.Circle, output.Cross);
-        }
-
-        if (swapXY)
-        {
-            (output.Square, output.Triangle) = (output.Triangle, output.Square);
-        }
 
         return output;
     }
@@ -3240,12 +4641,11 @@ public class Joycon
     {
         return type switch
         {
-            ControllerType.JoyconLeft  => "Left joycon",
+            ControllerType.JoyconLeft => "Left joycon",
             ControllerType.JoyconRight => "Right joycon",
-            ControllerType.Pro         => "Pro controller",
-            ControllerType.SNES        => "SNES controller",
-            ControllerType.N64         => "N64 controller",
-            _                          => "Controller"
+            ControllerType.Pro => "Pro controller",
+            ControllerType.SNES => "SNES controller",
+            _ => "Controller"
         };
     }
 
@@ -3331,6 +4731,11 @@ public class Joycon
             {
                 OutDs4.Disconnect();
             }
+        }
+
+        if (oldConfig.HomeLEDOn != Config.HomeLEDOn)
+        {
+            SetHomeLight(Config.HomeLEDOn);
         }
 
         if (oldConfig.DefaultDeadzone != Config.DefaultDeadzone)
