@@ -1,6 +1,5 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
 using System.Net.NetworkInformation;
@@ -41,7 +40,6 @@ public class JoyconManager
     private const ushort ProductR = 0x2007;
     private const ushort ProductPro = 0x2009;
     private const ushort ProductSNES = 0x2017;
-    private const ushort ProductN64 = 0x2019;
 
     public readonly bool EnableIMU = true;
     public readonly bool EnableLocalize = false;
@@ -65,7 +63,6 @@ public class JoyconManager
             Unknown,
             Connected,
             Disconnected,
-            ForceDisconnected,
             Errored,
             VirtualControllerErrored
         }
@@ -112,7 +109,7 @@ public class JoyconManager
             _form.Log($"Invalid hidapi.dll. (32 bits VS 64 bits)", e);
             return false;
         }
-        
+
         if (ret != 0)
         {
             _form.Log("Could not initialize hidapi.", Logger.LogLevel.Error);
@@ -202,35 +199,29 @@ public class JoyconManager
                     switch (job.Notification)
                     {
                         case DeviceNotification.Type.Connected:
-                        {
-                            var deviceInfos = (HIDApi.HIDDeviceInfo)job.Data;
-                            OnDeviceConnected(deviceInfos);
-                            break;
-                        }
+                            {
+                                var deviceInfos = (HIDApi.HIDDeviceInfo)job.Data;
+                                OnDeviceConnected(deviceInfos);
+                                break;
+                            }
                         case DeviceNotification.Type.Disconnected:
-                        {
-                            var deviceInfos = (HIDApi.HIDDeviceInfo)job.Data;
-                            OnDeviceDisconnected(deviceInfos);
-                            break;
-                        }
-                        case DeviceNotification.Type.ForceDisconnected:
-                        {
-                            var deviceIdentifier = (ControllerIdentifier)job.Data;
-                            OnDeviceDisconnected(deviceIdentifier);
-                            break;
-                        }
+                            {
+                                var deviceInfos = (HIDApi.HIDDeviceInfo)job.Data;
+                                OnDeviceDisconnected(deviceInfos);
+                                break;
+                            }
                         case DeviceNotification.Type.Errored:
-                        {
-                            var deviceIdentifier = (ControllerIdentifier)job.Data;
-                            OnDeviceErrored(deviceIdentifier);
-                            break;
-                        }
+                            {
+                                var deviceIdentifier = (ControllerIdentifier)job.Data;
+                                OnDeviceErrored(deviceIdentifier);
+                                break;
+                            }
                         case DeviceNotification.Type.VirtualControllerErrored:
-                        {
-                            var deviceIdentifier = (ControllerIdentifier)job.Data;
-                            OnVirtualControllerErrored(deviceIdentifier);
-                            break;
-                        }
+                            {
+                                var deviceIdentifier = (ControllerIdentifier)job.Data;
+                                OnVirtualControllerErrored(deviceIdentifier);
+                                break;
+                            }
                     }
                 }
             } while (read);
@@ -245,8 +236,7 @@ public class JoyconManager
         }
 
         var validController = (info.ProductId == ProductL || info.ProductId == ProductR ||
-                               info.ProductId == ProductPro || info.ProductId == ProductSNES ||
-                               info.ProductId == ProductN64) &&
+                               info.ProductId == ProductPro || info.ProductId == ProductSNES) &&
                               info.VendorId == VendorId;
 
         // check if it's a custom controller
@@ -290,9 +280,6 @@ public class JoyconManager
                 break;
             case ProductSNES:
                 type = Joycon.ControllerType.SNES;
-                break;
-            case ProductN64:
-                type = Joycon.ControllerType.N64;
                 break;
         }
 
@@ -350,7 +337,7 @@ public class JoyconManager
         {
             Controllers.Add(controller);
         }
-        
+
         _form.AddController(controller);
 
         // attempt to auto join-up joycons on connection
@@ -399,13 +386,6 @@ public class JoyconManager
 
         Joycon.Status oldState = controller.State;
         controller.StateChanged -= OnControllerStateChanged;
-
-        if (controller.IsDeviceReady)
-        {
-            // change the controller state to avoid trying to send command to it
-            controller.Drop(false, false);
-        }
-        
         controller.Detach();
 
         var otherController = controller.Other;
@@ -413,7 +393,7 @@ public class JoyconManager
         if (otherController != null && otherController != controller)
         {
             otherController.Other = null; // The other of the other is the joycon itself
-            otherController.RequestSetLEDByPadID();
+            SetLEDByPadID(otherController);
 
             try
             {
@@ -437,24 +417,6 @@ public class JoyconManager
         _form.Log($"[P{controller.PadId + 1}] {name} disconnected.");
     }
 
-    private void OnDeviceDisconnected(ControllerIdentifier deviceIdentifier)
-    {
-        Joycon controller = GetControllerByPath(deviceIdentifier.Path);
-        if (controller == null ||
-            controller.TimestampCreation != deviceIdentifier.TimestampCreation)
-        {
-            return;
-        }
-
-        if (controller.IsDeviceReady)
-        {
-            // device not dropped anymore (after a reset or a reconnection from the system)
-            return;
-        }
-        
-        OnDeviceDisconnected(controller);
-    }
-
     private void OnDeviceErrored(ControllerIdentifier deviceIdentifier)
     {
         Joycon controller = GetControllerByPath(deviceIdentifier.Path);
@@ -469,7 +431,7 @@ public class JoyconManager
             // device not in error anymore (after a reset or a reconnection from the system)
             return;
         }
-        
+
         OnDeviceDisconnected(controller);
         OnDeviceConnected(controller.Path, controller.SerialNumber, controller.Type, controller.IsUSB, controller.IsThirdParty, true);
     }
@@ -518,7 +480,7 @@ public class JoyconManager
 
     private void OnControllerStateChanged(object sender, Joycon.StateChangedEventArgs e)
     {
-        if (sender == null || _ctsDevicesNotifications.IsCancellationRequested)
+        if (sender == null)
         {
             return;
         }
@@ -535,9 +497,6 @@ public class JoyconManager
             case Joycon.Status.Errored:
                 ReconnectControllerDelayed(controller);
                 break;
-            case Joycon.Status.Dropped:
-                DisconnectController(controller);
-                break;
         }
     }
     private void ReconnectControllerDelayed(Joycon controller, int delayMs = 2000)
@@ -550,14 +509,6 @@ public class JoyconManager
         var writer = _channelDeviceNotifications.Writer;
         var identifier = new ControllerIdentifier(controller);
         var notification = new DeviceNotification(DeviceNotification.Type.Errored, identifier);
-        while (!writer.TryWrite(notification)) { }
-    }
-
-    private void DisconnectController(Joycon controller)
-    {
-        var writer = _channelDeviceNotifications.Writer;
-        var identifier = new ControllerIdentifier(controller);
-        var notification = new DeviceNotification(DeviceNotification.Type.ForceDisconnected, identifier);
         while (!writer.TryWrite(notification)) { }
     }
 
@@ -607,10 +558,6 @@ public class JoyconManager
                 return ProductL;
             case 3:
                 return ProductR;
-            case 4:
-                return ProductSNES;
-            case 5:
-                return ProductN64;
         }
 
         return 0;
@@ -630,39 +577,21 @@ public class JoyconManager
         {
             HIDApi.HotplugDeregisterCallback(_hidCallbackHandle);
         }
-        
+
         await _devicesNotificationTask;
-        
+        _ctsDevicesNotifications.Dispose();
+
         foreach (var controller in Controllers)
         {
             controller.StateChanged -= OnControllerStateChanged;
 
             if (controller.Config.AutoPowerOff && !controller.IsUSB)
             {
-                controller.RequestPowerOff();
+                controller.PowerOff();
             }
-        }
-        
-        Stopwatch timeSincePowerOff = Stopwatch.StartNew();
-        int timeoutPowerOff = 1800; // a bit of extra time to have 3 attempts
 
-        foreach (var controller in Controllers)
-        {
-            if (controller.Config.AutoPowerOff && !controller.IsUSB)
-            {
-                controller.WaitPowerOff(timeoutPowerOff);
-
-                timeoutPowerOff -= (int)timeSincePowerOff.ElapsedMilliseconds;
-                if (timeoutPowerOff < 0)
-                {
-                    timeoutPowerOff = 0;
-                }
-            }
-            
             controller.Detach();
         }
-        
-        _ctsDevicesNotifications.Dispose();
 
         HIDApi.Exit();
     }
@@ -696,8 +625,8 @@ public class JoyconManager
             controller.Other = otherController;
             otherController.Other = controller;
 
-            controller.RequestSetLEDByPadID();
-            otherController.RequestSetLEDByPadID();
+            SetLEDByPadID(controller);
+            SetLEDByPadID(otherController);
 
             var rightController = controller.IsLeft ? otherController : controller;
             rightController.DisconnectViGEm();
@@ -745,8 +674,8 @@ public class JoyconManager
         controller.Other = null;
         otherController.Other = null;
 
-        controller.RequestSetLEDByPadID();
-        otherController.RequestSetLEDByPadID();
+        SetLEDByPadID(controller);
+        SetLEDByPadID(otherController);
 
         return true;
     }
@@ -768,7 +697,7 @@ public class JoyconManager
                 change = true;
             }
         }
-        else 
+        else
         {
             Joycon other = controller.Other;
 
@@ -782,9 +711,56 @@ public class JoyconManager
         return change;
     }
 
+    public void SetLEDByPadID(Joycon controller)
+    {
+        controller.HidapiLock.EnterReadLock();
+        try
+        {
+            controller.SetLEDByPadID();
+        }
+        finally
+        {
+            controller.HidapiLock.ExitReadLock();
+        }
+    }
+
+    public void SetHomeLight(Joycon controller, bool on)
+    {
+        controller.HidapiLock.EnterReadLock();
+        try
+        {
+            controller.SetHomeLight(on);
+        }
+        finally
+        {
+            controller.HidapiLock.ExitReadLock();
+        }
+    }
+
+    public void PowerOff(Joycon controller)
+    {
+        controller.HidapiLock.EnterReadLock();
+        try
+        {
+            controller.PowerOff();
+        }
+        finally
+        {
+            controller.HidapiLock.ExitReadLock();
+        }
+    }
+
     public void ApplyConfig(Joycon controller, bool showErrors = true)
     {
-        controller.ApplyConfig(showErrors);
+        controller.HidapiLock.EnterReadLock();
+        try
+        {
+            controller.ApplyConfig(showErrors);
+        }
+        finally
+        {
+            controller.HidapiLock.ExitReadLock();
+        }
     }
 }
 
