@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Configuration;
 using System.Diagnostics;
@@ -120,7 +120,7 @@ public partial class MainForm : Form
                 }
                 ++index;
             }
-                
+
             comboBox.SelectedIndexChanged += ConfigItemChanged;
             childControl = comboBox;
         }
@@ -229,7 +229,7 @@ public partial class MainForm : Form
 
         WindowState = FormWindowState.Minimized;
         notifyIcon.Visible = true;
-        
+
         if (!init)
         {
             notifyIcon.BalloonTipText = "Double click the tray icon to maximise!";
@@ -311,7 +311,7 @@ public partial class MainForm : Form
             // We can close now (happens after the Close() call)
             return;
         }
-        
+
         e.Cancel = true;
 
         if (_closing)
@@ -382,7 +382,7 @@ public partial class MainForm : Form
         {
             console.AppendText(message + Environment.NewLine);
         }
-        
+
         _logger?.Log(message, level);
     }
 
@@ -398,7 +398,7 @@ public partial class MainForm : Form
         {
             console.AppendText($"{message} {e.Display()}{Environment.NewLine}");
         }
-        
+
         _logger?.Log(message, e, level);
     }
 
@@ -751,20 +751,10 @@ public partial class MainForm : Form
 
         _countDown = new Timer();
         _count = 4;
+        _countDown.Tick += CountDownIMU;
         _countDown.Interval = 1000;
         _countDown.Tag = controller;
-
-        if (controller.IMUSupported())
-        {
-            _countDown.Tick += CountDownIMU;
-            CountDownIMU(null, null);
-        }
-        else
-        {
-            _countDown.Tick += CountDownSticksCenter;
-            CountDownSticksCenter(null, null);
-        }
-       
+        CountDownIMU(null, null);
         _countDown.Start();
     }
 
@@ -1284,9 +1274,6 @@ public partial class MainForm : Form
                 break;
             case Joycon.ControllerType.SNES:
                 temp = charging ? Resources.snes_charging : Resources.snes;
-                break;
-            case Joycon.ControllerType.N64:
-                temp = charging ? Resources.n64_charging : Resources.n64;
                 break;
             default:
                 temp = Resources.cross;
